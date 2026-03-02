@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import UserDict
 from unittest.mock import MagicMock
 
 import mlx.core as mx
@@ -902,20 +903,67 @@ class TestDetectGenPromptSuffix:
         runner._gen_prompt_suffix = ()
         return runner
 
+    def _make_tokenizer(self, side_effect):
+        """Create a mock tokenizer that won't be unwrapped as a VLM processor."""
+        tokenizer = MagicMock(spec=["apply_chat_template"])
+        tokenizer.apply_chat_template = MagicMock(side_effect=side_effect)
+        return tokenizer
+
     def test_working_chat_template(self) -> None:
         """Detects suffix when template adds generation prompt tokens."""
         runner = self._make_runner()
-        tokenizer = MagicMock()
-        # without gen prompt: [1, 2, 3]
-        # with gen prompt: [1, 2, 3, 50, 51, 52]
-        tokenizer.apply_chat_template = MagicMock(
-            side_effect=lambda msgs, add_generation_prompt, tokenize: (
+        runner.tokenizer = self._make_tokenizer(
+            lambda msgs, add_generation_prompt, tokenize: (
                 [1, 2, 3, 50, 51, 52] if add_generation_prompt else [1, 2, 3]
             )
         )
-        runner.tokenizer = tokenizer
         result = runner._detect_gen_prompt_suffix()
         assert result == (50, 51, 52)
+
+    def test_working_chat_template_dict_return(self) -> None:
+        """Detects suffix when apply_chat_template returns a dict (transformers >=5.x)."""
+        runner = self._make_runner()
+        runner.tokenizer = self._make_tokenizer(
+            lambda msgs, add_generation_prompt, tokenize: (
+                {"input_ids": [1, 2, 3, 50, 51, 52], "attention_mask": [1] * 6}
+                if add_generation_prompt
+                else {"input_ids": [1, 2, 3], "attention_mask": [1] * 3}
+            )
+        )
+        result = runner._detect_gen_prompt_suffix()
+        assert result == (50, 51, 52)
+
+    def test_working_chat_template_userdict_return(self) -> None:
+        """Detects suffix when apply_chat_template returns a UserDict (BatchEncoding)."""
+        runner = self._make_runner()
+
+        def side_effect(msgs, add_generation_prompt, tokenize):
+            d = UserDict()
+            if add_generation_prompt:
+                d["input_ids"] = [1, 2, 3, 50, 51, 52]
+                d["attention_mask"] = [1] * 6
+            else:
+                d["input_ids"] = [1, 2, 3]
+                d["attention_mask"] = [1] * 3
+            return d
+
+        runner.tokenizer = self._make_tokenizer(side_effect)
+        result = runner._detect_gen_prompt_suffix()
+        assert result == (50, 51, 52)
+
+    def test_vlm_processor_unwrap(self) -> None:
+        """Unwraps VLM processor to inner tokenizer for suffix detection."""
+        runner = self._make_runner()
+        inner_tok = self._make_tokenizer(
+            lambda msgs, add_generation_prompt, tokenize: (
+                [1, 2, 3, 50, 51] if add_generation_prompt else [1, 2, 3]
+            )
+        )
+        processor = MagicMock(spec=["tokenizer"])
+        processor.tokenizer = inner_tok
+        runner.tokenizer = processor
+        result = runner._detect_gen_prompt_suffix()
+        assert result == (50, 51)
 
     def test_no_tokenizer(self) -> None:
         """Returns empty tuple when tokenizer is None."""
@@ -927,34 +975,29 @@ class TestDetectGenPromptSuffix:
     def test_no_chat_template(self) -> None:
         """Returns empty tuple when apply_chat_template raises."""
         runner = self._make_runner()
-        tokenizer = MagicMock()
-        tokenizer.apply_chat_template = MagicMock(side_effect=Exception("no template"))
-        runner.tokenizer = tokenizer
+        runner.tokenizer = self._make_tokenizer(
+            MagicMock(side_effect=Exception("no template"))
+        )
         result = runner._detect_gen_prompt_suffix()
         assert result == ()
 
     def test_incompatible_templates(self) -> None:
         """Returns empty tuple when with_gen is not a prefix of without_gen."""
         runner = self._make_runner()
-        tokenizer = MagicMock()
-        # Templates produce completely different sequences
-        tokenizer.apply_chat_template = MagicMock(
-            side_effect=lambda msgs, add_generation_prompt, tokenize: (
+        runner.tokenizer = self._make_tokenizer(
+            lambda msgs, add_generation_prompt, tokenize: (
                 [10, 20, 30, 40] if add_generation_prompt else [1, 2, 3]
             )
         )
-        runner.tokenizer = tokenizer
         result = runner._detect_gen_prompt_suffix()
         assert result == ()
 
     def test_no_suffix_added(self) -> None:
         """Returns empty tuple when gen prompt adds no tokens."""
         runner = self._make_runner()
-        tokenizer = MagicMock()
-        tokenizer.apply_chat_template = MagicMock(
-            side_effect=lambda msgs, add_generation_prompt, tokenize: [1, 2, 3]
+        runner.tokenizer = self._make_tokenizer(
+            lambda msgs, add_generation_prompt, tokenize: [1, 2, 3]
         )
-        runner.tokenizer = tokenizer
         result = runner._detect_gen_prompt_suffix()
         assert result == ()
 

@@ -887,16 +887,29 @@ class MetalModelRunner:
         """
         if self.tokenizer is None:
             return ()
+        # VLM processors wrap the real tokenizer; unwrap to get
+        # a plain tokenizer with a working apply_chat_template.
+        tok = self.tokenizer
+        if hasattr(tok, "tokenizer"):
+            tok = tok.tokenizer
+        if not hasattr(tok, "apply_chat_template"):
+            return ()
         try:
             dummy = [{"role": "user", "content": "x"}]
-            with_gen = self.tokenizer.apply_chat_template(
+            with_gen = tok.apply_chat_template(
                 dummy, add_generation_prompt=True, tokenize=True
             )
-            without_gen = self.tokenizer.apply_chat_template(
+            without_gen = tok.apply_chat_template(
                 dummy, add_generation_prompt=False, tokenize=True
             )
         except Exception:
             return ()
+        # transformers >=5.x may return BatchEncoding (a UserDict subclass)
+        # instead of a plain list; extract input_ids.
+        if not isinstance(with_gen, list):
+            with_gen = with_gen["input_ids"]
+        if not isinstance(without_gen, list):
+            without_gen = without_gen["input_ids"]
         n = len(without_gen)
         if len(with_gen) <= n or with_gen[:n] != without_gen:
             return ()
@@ -1424,21 +1437,8 @@ class MetalModelRunner:
             and tuple(token_ids[-len(gen_suffix) :]) == gen_suffix
         ):
             cache_boundary = len(token_ids) - len(gen_suffix)
-            logger.info(
-                "Stripped gen prompt: %d tokens → %d cache key",
-                len(token_ids),
-                cache_boundary,
-            )
         else:
             cache_boundary = len(token_ids) - 1 if len(token_ids) > 1 else 0
-            if gen_suffix:
-                logger.info(
-                    "Gen prompt suffix not at end: tail=%s expected=%s",
-                    tuple(token_ids[-len(gen_suffix) :])
-                    if len(token_ids) >= len(gen_suffix)
-                    else "too_short",
-                    gen_suffix,
-                )
         prefix = token_ids[:cache_boundary] if cache_boundary > 0 else []
         cache_model = (
             self.model.language_model
