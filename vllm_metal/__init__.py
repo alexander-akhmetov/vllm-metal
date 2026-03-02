@@ -99,7 +99,33 @@ def _register_ops() -> None:
     """Register Metal operations with vLLM.
 
     This is the entry point for vLLM's general plugin system.
-    Currently a no-op as operations are handled internally.
     """
-    # Operations are registered implicitly through the MLX backend
-    pass
+    _patch_rope_validation_compat()
+
+
+def _patch_rope_validation_compat() -> None:
+    """Fix list vs set type mismatch for ignore_keys_at_rope_validation.
+
+    vLLM model configs pass ignore_keys_at_rope_validation as a list,
+    but transformers >=5.2 expects a set (uses the | operator).
+    """
+    try:
+        from transformers.modeling_rope_utils import RotaryEmbeddingConfigMixin
+    except ImportError:
+        return
+
+    orig = RotaryEmbeddingConfigMixin.convert_rope_params_to_dict
+    if getattr(orig, "_metal_patched", False):
+        return
+
+    def _patched(self, ignore_keys_at_rope_validation=None, **kwargs):
+        if isinstance(ignore_keys_at_rope_validation, list):
+            ignore_keys_at_rope_validation = set(ignore_keys_at_rope_validation)
+        return orig(
+            self,
+            ignore_keys_at_rope_validation=ignore_keys_at_rope_validation,
+            **kwargs,
+        )
+
+    _patched._metal_patched = True
+    RotaryEmbeddingConfigMixin.convert_rope_params_to_dict = _patched

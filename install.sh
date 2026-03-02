@@ -123,16 +123,19 @@ main() {
 
   ensure_venv "$venv"
 
-  local vllm_v="0.14.1"
-  local url_base="https://github.com/vllm-project/vllm/releases/download"
-  local filename="vllm-$vllm_v.tar.gz"
-  curl -OL $url_base/v$vllm_v/$filename
-  tar xf $filename
-  cd vllm-$vllm_v
+  local vllm_commit="de7dd634b969adc6e5f50cff0cc09c1be1711d01"
+  local vllm_short="${vllm_commit:0:12}"
+  curl -fsSL "https://github.com/vllm-project/vllm/archive/${vllm_commit}.tar.gz" \
+      -o "vllm-${vllm_short}.tar.gz"
+  tar xf "vllm-${vllm_short}.tar.gz"
+  cd "vllm-${vllm_commit}"
   uv pip install -r requirements/cpu.txt --index-strategy unsafe-best-match
-  uv pip install .
-  cd -
-  rm -rf vllm-$vllm_v*
+  SETUPTOOLS_SCM_PRETEND_VERSION=0.17.0.dev0 uv pip install .
+  cd - > /dev/null
+  rm -rf "vllm-${vllm_commit}" "vllm-${vllm_short}.tar.gz"
+
+  # Upgrade deps for Qwen3.5 model implementations
+  uv pip install 'mlx-lm>=0.30.7' 'mlx-vlm>=0.3.12' 'transformers>=5.2.0'
 
   if [[ -n "$local_lib" && -f "$local_lib" ]]; then
     uv pip install .
