@@ -16,6 +16,7 @@ class TestPrefixCacheHybridGuard:
         runner.model = MagicMock()
         runner._is_vlm = False
         runner._prefix_cache = mr.PrefixCacheManager(max_bytes=1024 * 1024)
+        runner._gen_prompt_suffix = ()
         return runner
 
     def test_hybrid_model_uses_prefix_cache(self, monkeypatch) -> None:
@@ -684,7 +685,6 @@ class TestLongestPrefixMatch:
         assert list(result_a[0].token_ids) == list(range(100))
         assert list(result_b[0].token_ids) == list(range(100, 200))
 
-
     def test_lcp_trailing_mismatch(self) -> None:
         """Entry of 100 tokens where last 2 diverge → match_len=98."""
         mgr = mr.PrefixCacheManager(max_bytes=10 * 1024 * 1024)
@@ -708,11 +708,11 @@ class TestLongestPrefixMatch:
         LCP finds 99 matching tokens (all except the trailing <think>).
         """
         mgr = mr.PrefixCacheManager(max_bytes=10 * 1024 * 1024)
-        THINK_TOKEN = 248068
+        think_token = 248068
 
         # Turn 1: shared prefix + generation prompt token
         shared = list(range(99))
-        cached_prefix = shared + [THINK_TOKEN]
+        cached_prefix = shared + [think_token]
         mgr.insert(cached_prefix, [self._make_kv()])
 
         # Turn 2: shared prefix + actual content
@@ -774,7 +774,6 @@ class TestLongestPrefixMatch:
             assert restored_full[0].state[0].shape[2] == 100
         finally:
             mr_mod.make_prompt_cache = original_make
-
 
     def test_partial_match_rejected_for_arrays_cache_entry(self) -> None:
         """Partial LCP match is rejected when entry contains ArraysCache state."""
@@ -892,3 +891,249 @@ class TestPrefixCacheFractionParsing:
         result = mr._get_prefix_cache_max_bytes()
         fallback = 8 * 1024**3
         assert result == int(fallback * mr._PREFIX_CACHE_DEFAULT_FRACTION)
+
+
+class TestDetectGenPromptSuffix:
+    """Tests for _detect_gen_prompt_suffix() suffix detection."""
+
+    def _make_runner(self) -> mr.MetalModelRunner:
+        runner = mr.MetalModelRunner.__new__(mr.MetalModelRunner)
+        runner.tokenizer = None
+        runner._gen_prompt_suffix = ()
+        return runner
+
+    def test_working_chat_template(self) -> None:
+        """Detects suffix when template adds generation prompt tokens."""
+        runner = self._make_runner()
+        tokenizer = MagicMock()
+        # without gen prompt: [1, 2, 3]
+        # with gen prompt: [1, 2, 3, 50, 51, 52]
+        tokenizer.apply_chat_template = MagicMock(
+            side_effect=lambda msgs, add_generation_prompt, tokenize: (
+                [1, 2, 3, 50, 51, 52] if add_generation_prompt else [1, 2, 3]
+            )
+        )
+        runner.tokenizer = tokenizer
+        result = runner._detect_gen_prompt_suffix()
+        assert result == (50, 51, 52)
+
+    def test_no_tokenizer(self) -> None:
+        """Returns empty tuple when tokenizer is None."""
+        runner = self._make_runner()
+        runner.tokenizer = None
+        result = runner._detect_gen_prompt_suffix()
+        assert result == ()
+
+    def test_no_chat_template(self) -> None:
+        """Returns empty tuple when apply_chat_template raises."""
+        runner = self._make_runner()
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = MagicMock(side_effect=Exception("no template"))
+        runner.tokenizer = tokenizer
+        result = runner._detect_gen_prompt_suffix()
+        assert result == ()
+
+    def test_incompatible_templates(self) -> None:
+        """Returns empty tuple when with_gen is not a prefix of without_gen."""
+        runner = self._make_runner()
+        tokenizer = MagicMock()
+        # Templates produce completely different sequences
+        tokenizer.apply_chat_template = MagicMock(
+            side_effect=lambda msgs, add_generation_prompt, tokenize: (
+                [10, 20, 30, 40] if add_generation_prompt else [1, 2, 3]
+            )
+        )
+        runner.tokenizer = tokenizer
+        result = runner._detect_gen_prompt_suffix()
+        assert result == ()
+
+    def test_no_suffix_added(self) -> None:
+        """Returns empty tuple when gen prompt adds no tokens."""
+        runner = self._make_runner()
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = MagicMock(
+            side_effect=lambda msgs, add_generation_prompt, tokenize: [1, 2, 3]
+        )
+        runner.tokenizer = tokenizer
+        result = runner._detect_gen_prompt_suffix()
+        assert result == ()
+
+
+class TestPrefillStripGenPrompt:
+    """Tests for gen prompt stripping in _prefill_single() cache boundary."""
+
+    def _make_runner(self, gen_suffix: tuple[int, ...] = ()) -> mr.MetalModelRunner:
+        runner = mr.MetalModelRunner.__new__(mr.MetalModelRunner)
+        runner.model = MagicMock()
+        runner._is_vlm = False
+        runner._prefix_cache = mr.PrefixCacheManager(max_bytes=1024 * 1024)
+        runner._gen_prompt_suffix = gen_suffix
+        return runner
+
+    def test_strips_gen_prompt_from_cache_key(self, monkeypatch) -> None:
+        """Cache key excludes gen prompt suffix when detected."""
+        gen_suffix = (50, 51, 52)
+        runner = self._make_runner(gen_suffix=gen_suffix)
+
+        lookup_spy = MagicMock(return_value=None)
+        insert_spy = MagicMock()
+
+        def fake_make_prompt_cache(model):
+            kv = mr.KVCache()
+            kv.keys = mx.zeros((1, 8, 0, 64))
+            kv.values = mx.zeros((1, 8, 0, 64))
+            kv.offset = 0
+            return [kv]
+
+        monkeypatch.setattr(mr, "make_prompt_cache", fake_make_prompt_cache)
+        monkeypatch.setattr(runner._prefix_cache, "lookup", lookup_spy)
+        monkeypatch.setattr(runner._prefix_cache, "insert", insert_spy)
+
+        fake_logits = mx.zeros((1, 5, 100))
+        runner.model.return_value = MagicMock(logits=fake_logits)
+
+        # token_ids ends with gen prompt suffix
+        token_ids = [1, 2, 3, 4, 5] + list(gen_suffix)
+        sampling_params = MagicMock(
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            frequency_penalty=0,
+            presence_penalty=0,
+            repetition_penalty=1.0,
+        )
+
+        runner._prefill_single("req-1", token_ids, sampling_params)
+
+        # Should strip suffix: lookup key is [1,2,3,4,5] not [1,2,3,4,5,50,51]
+        lookup_spy.assert_called_once_with([1, 2, 3, 4, 5])
+
+    def test_no_strip_when_suffix_not_at_end(self, monkeypatch) -> None:
+        """Falls back to [:-1] when suffix is not at end of token_ids."""
+        gen_suffix = (50, 51, 52)
+        runner = self._make_runner(gen_suffix=gen_suffix)
+
+        lookup_spy = MagicMock(return_value=None)
+        insert_spy = MagicMock()
+
+        def fake_make_prompt_cache(model):
+            kv = mr.KVCache()
+            kv.keys = mx.zeros((1, 8, 0, 64))
+            kv.values = mx.zeros((1, 8, 0, 64))
+            kv.offset = 0
+            return [kv]
+
+        monkeypatch.setattr(mr, "make_prompt_cache", fake_make_prompt_cache)
+        monkeypatch.setattr(runner._prefix_cache, "lookup", lookup_spy)
+        monkeypatch.setattr(runner._prefix_cache, "insert", insert_spy)
+
+        fake_logits = mx.zeros((1, 5, 100))
+        runner.model.return_value = MagicMock(logits=fake_logits)
+
+        # token_ids does NOT end with gen prompt suffix
+        token_ids = [1, 2, 3, 4, 5, 6, 7]
+        sampling_params = MagicMock(
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            frequency_penalty=0,
+            presence_penalty=0,
+            repetition_penalty=1.0,
+        )
+
+        runner._prefill_single("req-1", token_ids, sampling_params)
+
+        # Fallback: [:-1] → [1,2,3,4,5,6]
+        lookup_spy.assert_called_once_with([1, 2, 3, 4, 5, 6])
+
+    def test_no_strip_when_no_suffix(self, monkeypatch) -> None:
+        """Behaves as before when _gen_prompt_suffix is empty."""
+        runner = self._make_runner(gen_suffix=())
+
+        lookup_spy = MagicMock(return_value=None)
+        insert_spy = MagicMock()
+
+        def fake_make_prompt_cache(model):
+            kv = mr.KVCache()
+            kv.keys = mx.zeros((1, 8, 0, 64))
+            kv.values = mx.zeros((1, 8, 0, 64))
+            kv.offset = 0
+            return [kv]
+
+        monkeypatch.setattr(mr, "make_prompt_cache", fake_make_prompt_cache)
+        monkeypatch.setattr(runner._prefix_cache, "lookup", lookup_spy)
+        monkeypatch.setattr(runner._prefix_cache, "insert", insert_spy)
+
+        fake_logits = mx.zeros((1, 5, 100))
+        runner.model.return_value = MagicMock(logits=fake_logits)
+
+        token_ids = [1, 2, 3, 4, 5]
+        sampling_params = MagicMock(
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            frequency_penalty=0,
+            presence_penalty=0,
+            repetition_penalty=1.0,
+        )
+
+        runner._prefill_single("req-1", token_ids, sampling_params)
+
+        # Original behavior: [:-1]
+        lookup_spy.assert_called_once_with([1, 2, 3, 4])
+
+
+class TestHybridMultiTurnFullMatch:
+    """End-to-end: hybrid entry gets full match when gen prompt is stripped."""
+
+    def test_multi_turn_full_match(self, monkeypatch) -> None:
+        """Turn 2 gets exact HIT when gen prompt is stripped from both turns."""
+        gen_suffix = (50, 51, 52)
+
+        runner = mr.MetalModelRunner.__new__(mr.MetalModelRunner)
+        runner.model = MagicMock()
+        runner._is_vlm = False
+        runner._prefix_cache = mr.PrefixCacheManager(max_bytes=10 * 1024 * 1024)
+        runner._gen_prompt_suffix = gen_suffix
+
+        def fake_make_prompt_cache(model):
+            kv1 = mr.KVCache()
+            kv1.keys = mx.zeros((1, 8, 0, 64))
+            kv1.values = mx.zeros((1, 8, 0, 64))
+            kv1.offset = 0
+            ac = mr.ArraysCache(2)
+            kv2 = mr.KVCache()
+            kv2.keys = mx.zeros((1, 8, 0, 64))
+            kv2.values = mx.zeros((1, 8, 0, 64))
+            kv2.offset = 0
+            return [kv1, ac, kv2]
+
+        monkeypatch.setattr(mr, "make_prompt_cache", fake_make_prompt_cache)
+
+        fake_logits = mx.zeros((1, 5, 100))
+        runner.model.return_value = MagicMock(logits=fake_logits)
+
+        sampling_params = MagicMock(
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            frequency_penalty=0,
+            presence_penalty=0,
+            repetition_penalty=1.0,
+        )
+
+        # Turn 1: [system, user1, gen_prompt_suffix]
+        shared = list(range(100))
+        turn1_tokens = shared + list(gen_suffix)
+        runner._prefill_single("turn1", turn1_tokens, sampling_params)
+
+        # Verify cache key is `shared` (stripped suffix)
+        assert tuple(shared) in runner._prefix_cache._entries
+
+        # Turn 2: [system, user1, assistant1, user2, gen_prompt_suffix]
+        turn2_tokens = shared + [200, 201, 202, 203] + list(gen_suffix)
+        runner._prefill_single("turn2", turn2_tokens, sampling_params)
+
+        # Turn 1's entry should have been an exact HIT (full match)
+        stats = runner._prefix_cache.get_stats()
+        assert stats["hits"] >= 1

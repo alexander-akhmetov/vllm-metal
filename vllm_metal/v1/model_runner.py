@@ -142,7 +142,6 @@ def _get_prefix_cache_max_bytes() -> int:
     return max_bytes
 
 
-
 def _compute_entry_bytes(
     cache_state: list[tuple[mx.array, mx.array] | list[mx.array | None] | None],
 ) -> int:
@@ -192,9 +191,7 @@ class PrefixCacheManager:
         self._hits = 0
         self._misses = 0
 
-    def lookup(
-        self, token_ids: list[int]
-    ) -> tuple[CachedPrefix, int] | None:
+    def lookup(self, token_ids: list[int]) -> tuple[CachedPrefix, int] | None:
         """Look up the longest cached prefix matching the start of token_ids.
 
         Returns (entry, match_len) where match_len is the number of tokens
@@ -249,9 +246,7 @@ class PrefixCacheManager:
 
     def _evict_until_fits(self, needed_bytes: int) -> None:
         """Evict entries until we have room for needed_bytes."""
-        while (
-            self._current_bytes + needed_bytes > self._max_bytes and self._entries
-        ):
+        while self._current_bytes + needed_bytes > self._max_bytes and self._entries:
             min_key, min_entry = min(
                 self._entries.items(), key=lambda x: x[1].ref_count
             )
@@ -858,6 +853,9 @@ class MetalModelRunner:
         if _PREFIX_CACHE_ENABLED:
             self._prefix_cache = PrefixCacheManager()
 
+        # Generation prompt suffix for cache key stripping
+        self._gen_prompt_suffix: tuple[int, ...] = ()
+
         # Paged attention state (set by worker when enabled)
         self._paged_kv_cache: Any = None  # MetalPagedKVCache, set by worker
         self._paged_block_size: int = 0
@@ -879,6 +877,30 @@ class MetalModelRunner:
         if hasattr(self.model_config, "is_multimodal_model"):
             return self.model_config.is_multimodal_model
         return False
+
+    def _detect_gen_prompt_suffix(self) -> tuple[int, ...]:
+        """Detect generation prompt suffix tokens from the chat template.
+
+        Compares apply_chat_template with and without add_generation_prompt
+        to extract the trailing tokens added by the generation prompt.
+        Returns empty tuple if detection fails or is not applicable.
+        """
+        if self.tokenizer is None:
+            return ()
+        try:
+            dummy = [{"role": "user", "content": "x"}]
+            with_gen = self.tokenizer.apply_chat_template(
+                dummy, add_generation_prompt=True, tokenize=True
+            )
+            without_gen = self.tokenizer.apply_chat_template(
+                dummy, add_generation_prompt=False, tokenize=True
+            )
+        except Exception:
+            return ()
+        n = len(without_gen)
+        if len(with_gen) <= n or with_gen[:n] != without_gen:
+            return ()
+        return tuple(with_gen[n:])
 
     def load_model(self) -> None:
         """Load the model using MLX with caching for fast repeated loads.
@@ -908,6 +930,7 @@ class MetalModelRunner:
                 self._extract_model_args()
                 self._resolve_model_dims()
                 self._initialize_kv_cache_dtype()
+                self._gen_prompt_suffix = self._detect_gen_prompt_suffix()
                 return
 
         # Load model using appropriate backend
@@ -932,6 +955,15 @@ class MetalModelRunner:
         self._extract_model_args()
         self._resolve_model_dims()
         self._initialize_kv_cache_dtype()
+        self._gen_prompt_suffix = self._detect_gen_prompt_suffix()
+        if self._gen_prompt_suffix:
+            logger.info(
+                "Detected gen prompt suffix: %d tokens %s",
+                len(self._gen_prompt_suffix),
+                self._gen_prompt_suffix,
+            )
+        else:
+            logger.info("No gen prompt suffix detected")
         load_time = time.time() - start_time
         logger.info(f"Model loaded in {load_time:.2f}s: {model_name}")
 
@@ -1382,8 +1414,32 @@ class MetalModelRunner:
         cache: list[KVCache]
         cached_prefix_len = 0
 
-        # Prefix caching: cache KV for tokens[:-1], always process last token
-        prefix = token_ids[:-1] if len(token_ids) > 1 else []
+        # Prefix caching: strip generation prompt suffix from cache key when
+        # present, otherwise fall back to tokens[:-1]. This ensures incremental
+        # chat turns produce exact prefix matches for hybrid models.
+        gen_suffix = self._gen_prompt_suffix
+        if (
+            gen_suffix
+            and len(token_ids) > len(gen_suffix) + 1
+            and tuple(token_ids[-len(gen_suffix) :]) == gen_suffix
+        ):
+            cache_boundary = len(token_ids) - len(gen_suffix)
+            logger.info(
+                "Stripped gen prompt: %d tokens → %d cache key",
+                len(token_ids),
+                cache_boundary,
+            )
+        else:
+            cache_boundary = len(token_ids) - 1 if len(token_ids) > 1 else 0
+            if gen_suffix:
+                logger.info(
+                    "Gen prompt suffix not at end: tail=%s expected=%s",
+                    tuple(token_ids[-len(gen_suffix) :])
+                    if len(token_ids) >= len(gen_suffix)
+                    else "too_short",
+                    gen_suffix,
+                )
+        prefix = token_ids[:cache_boundary] if cache_boundary > 0 else []
         cache_model = (
             self.model.language_model
             if self._is_vlm and hasattr(self.model, "language_model")
@@ -1408,10 +1464,13 @@ class MetalModelRunner:
                     logger.info(
                         "Prefix cache exact HIT for %d tokens (%d/%d hits)",
                         len(prefix),
-                        hits, total,
+                        hits,
+                        total,
                     )
                     cache = self._prefix_cache.restore_cache(
-                        cached, self.model, self._is_vlm,
+                        cached,
+                        self.model,
+                        self._is_vlm,
                         match_len=match_len,
                     )
                     cached_prefix_len = len(prefix)
@@ -1422,10 +1481,13 @@ class MetalModelRunner:
                         "Prefix cache partial HIT: %d of %d tokens (%d/%d hits)",
                         match_len,
                         len(prefix),
-                        hits, total,
+                        hits,
+                        total,
                     )
                     cache = self._prefix_cache.restore_cache(
-                        cached, self.model, self._is_vlm,
+                        cached,
+                        self.model,
+                        self._is_vlm,
                         match_len=match_len,
                     )
                     remaining_prefix = prefix[match_len:]
@@ -1438,7 +1500,8 @@ class MetalModelRunner:
                 logger.info(
                     "Prefix cache MISS for %d tokens (%d/%d hits)",
                     len(prefix),
-                    hits, total,
+                    hits,
+                    total,
                 )
                 prefix_ids = mx.array([prefix], dtype=mx.int32)
                 _ = self.model(prefix_ids, cache=cache)
