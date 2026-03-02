@@ -116,8 +116,8 @@ main() {
     exit 1
   fi
 
-  local venv="$HOME/.venv-vllm-metal"
-  if [[ -n "$local_lib" && -f "$local_lib" ]]; then
+  local venv="${VLLM_METAL_VENV:-$HOME/.venv-vllm-metal}"
+  if [[ -z "${VLLM_METAL_VENV:-}" ]] && [[ -n "$local_lib" && -f "$local_lib" ]]; then
     venv="$PWD/.venv-vllm-metal"
   fi
 
@@ -136,6 +136,19 @@ main() {
 
   # Upgrade deps for Qwen3.5 model implementations
   uv pip install 'mlx-lm>=0.30.7' 'mlx-vlm>=0.3.12' 'transformers>=5.2.0'
+
+  # Fix transformers rope validation list vs set bug (PR #44272, not yet released)
+  python3 "$(dirname "${BASH_SOURCE[0]:-$0}")/scripts/patch_transformers_rope.py" 2>/dev/null \
+    || python3 -c "
+import transformers, os
+path = os.path.join(os.path.dirname(transformers.__file__), 'modeling_rope_utils.py')
+with open(path) as f: content = f.read()
+old = 'set() if ignore_keys_at_rope_validation is None else ignore_keys_at_rope_validation'
+new = 'set() if ignore_keys_at_rope_validation is None else set(ignore_keys_at_rope_validation)'
+if old in content:
+    with open(path, 'w') as f: f.write(content.replace(old, new))
+    print('Patched transformers rope validation (list->set)')
+"
 
   if [[ -n "$local_lib" && -f "$local_lib" ]]; then
     uv pip install .

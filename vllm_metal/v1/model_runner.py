@@ -7,14 +7,12 @@ Optimized for performance with:
 - Pre-allocated input buffers to reduce allocation overhead
 - Rust-based token state management for efficient batch operations
 - Global model cache for fast repeated loads
-- Content hash prefix caching for shared prompt reuse
+- Longest-prefix matching cache for shared prompt reuse
 """
 
-import hashlib
 import math
 import os
 import time
-from array import array
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any, TypeAlias
@@ -87,6 +85,7 @@ _CACHE_CLEAR_INTERVAL = 50  # Clear cache every N finished requests
 
 # Prefix cache configuration — enabled by setting VLLM_METAL_PREFIX_CACHE
 # in the environment (any value; unset to disable).
+_MIN_PREFIX_MATCH = 32  # Minimum tokens for a partial prefix match
 
 
 def _prefix_cache_enabled() -> bool:
@@ -143,41 +142,49 @@ def _get_prefix_cache_max_bytes() -> int:
     return max_bytes
 
 
-def _compute_prefix_hash(token_ids: list[int]) -> bytes:
-    """Compute content hash for a token sequence."""
-    h = hashlib.sha256()
-    h.update(array("I", token_ids).tobytes())
-    return h.digest()
 
-
-def _compute_entry_bytes(cache_state: list[tuple[mx.array, mx.array] | None]) -> int:
+def _compute_entry_bytes(
+    cache_state: list[tuple[mx.array, mx.array] | list[mx.array | None] | None],
+) -> int:
     """Compute memory usage of a cache entry in bytes."""
     total = 0
-    for pair in cache_state:
-        if pair is not None:
-            total += pair[0].nbytes + pair[1].nbytes
+    for entry in cache_state:
+        if entry is None:
+            continue
+        if isinstance(entry, tuple):  # KVCache (k, v)
+            total += entry[0].nbytes + entry[1].nbytes
+        elif isinstance(entry, list):  # ArraysCache state
+            total += sum(s.nbytes for s in entry if s is not None)
     return total
 
 
-@dataclass
+@dataclass(eq=False)
 class CachedPrefix:
     """Cached KV state for a token prefix.
 
-    cache_state contains (k, v) tuples for KVCache layers, or None for
-    ArraysCache layers in hybrid models.
+    cache_state contains (k, v) tuples for KVCache layers,
+    list[mx.array | None] for ArraysCache layers in hybrid models,
+    or None for unsupported layer types.
     """
 
-    token_ids: list[int]
-    cache_state: list[tuple[mx.array, mx.array] | None]
+    token_ids: tuple[int, ...]
+    cache_state: list[tuple[mx.array, mx.array] | list[mx.array | None] | None]
     size_bytes: int = 0
     ref_count: int = 0
 
 
 class PrefixCacheManager:
-    """Manager for prefix KV cache reuse with memory-based eviction."""
+    """Manager for prefix KV cache reuse with longest-prefix matching.
+
+    Uses a hybrid dict + sorted list:
+    - ``_entries`` provides O(1) exact-match dedup by tuple key.
+    - ``_sorted`` is ordered by token length descending for longest-prefix
+      fallback via linear scan (negligible at <100 entries).
+    """
 
     def __init__(self, max_bytes: int | None = None):
-        self._cache: dict[bytes, CachedPrefix] = {}
+        self._entries: dict[tuple[int, ...], CachedPrefix] = {}
+        self._sorted: list[CachedPrefix] = []
         self._max_bytes = (
             max_bytes if max_bytes is not None else _get_prefix_cache_max_bytes()
         )
@@ -185,56 +192,97 @@ class PrefixCacheManager:
         self._hits = 0
         self._misses = 0
 
-    def lookup(self, token_ids: list[int]) -> CachedPrefix | None:
-        """Look up cached prefix by token IDs."""
-        prefix_hash = _compute_prefix_hash(token_ids)
-        cached = self._cache.get(prefix_hash)
+    def lookup(
+        self, token_ids: list[int]
+    ) -> tuple[CachedPrefix, int] | None:
+        """Look up the longest cached prefix matching the start of token_ids.
+
+        Returns (entry, match_len) where match_len is the number of tokens
+        that actually match. For exact matches, match_len == len(entry.token_ids).
+        For partial matches (e.g. trailing generation prompt mismatch),
+        match_len < len(entry.token_ids).
+        """
+        query = tuple(token_ids)
+
+        # Exact match (fast path)
+        cached = self._entries.get(query)
         if cached is not None:
             self._hits += 1
             cached.ref_count += 1
-            logger.debug(
-                "Prefix cache HIT: %d hits, %d misses, rate=%.1f%%",
-                self._hits,
-                self._misses,
-                self.hit_rate * 100,
+            return cached, len(cached.token_ids)
+
+        # Longest prefix match via LCP (linear scan, sorted longest-first)
+        best_entry: CachedPrefix | None = None
+        best_match_len = 0
+
+        for entry in self._sorted:
+            n = len(entry.token_ids)
+            if n <= best_match_len:
+                break  # sorted desc — can't beat current best
+
+            # Find longest common prefix between query and this entry
+            max_compare = min(n, len(query))
+            match_len = 0
+            for i in range(max_compare):
+                if query[i] != entry.token_ids[i]:
+                    break
+                match_len = i + 1
+
+            if match_len > best_match_len:
+                best_entry = entry
+                best_match_len = match_len
+
+        if best_entry is not None and best_match_len >= _MIN_PREFIX_MATCH:
+            # Partial matches are unsafe for entries with ArraysCache layers
+            # (Mamba/SSM state can't be truncated to an arbitrary prefix).
+            is_partial = best_match_len < len(best_entry.token_ids)
+            has_arrays_cache = is_partial and any(
+                isinstance(s, list) for s in best_entry.cache_state
             )
-            return cached
+            if not has_arrays_cache:
+                self._hits += 1
+                best_entry.ref_count += 1
+                return best_entry, best_match_len
+
         self._misses += 1
-        logger.debug(
-            "Prefix cache MISS: %d hits, %d misses, rate=%.1f%%",
-            self._hits,
-            self._misses,
-            self.hit_rate * 100,
-        )
         return None
 
     def _evict_until_fits(self, needed_bytes: int) -> None:
         """Evict entries until we have room for needed_bytes."""
-        while self._current_bytes + needed_bytes > self._max_bytes and self._cache:
-            min_hash, min_entry = min(self._cache.items(), key=lambda x: x[1].ref_count)
+        while (
+            self._current_bytes + needed_bytes > self._max_bytes and self._entries
+        ):
+            min_key, min_entry = min(
+                self._entries.items(), key=lambda x: x[1].ref_count
+            )
             self._current_bytes -= min_entry.size_bytes
-            del self._cache[min_hash]
+            del self._entries[min_key]
+            self._sorted.remove(min_entry)
             logger.debug(
                 "Prefix cache eviction: freed %.1fMB",
                 min_entry.size_bytes / (1024 * 1024),
             )
 
-    def insert(self, token_ids: list[int], cache: list[KVCache]) -> None:
+    def insert(self, token_ids: list[int], cache: list["AnyCache"]) -> None:
         """Insert a prefix cache entry with memory-based eviction.
 
-        Only KVCache layers are cached. ArraysCache layers are skipped (stored as
-        None) for hybrid model compatibility.
+        KVCache layers are stored as (k, v) tuples.
+        ArraysCache layers are stored as list[mx.array | None].
         """
-        prefix_hash = _compute_prefix_hash(token_ids)
-        if prefix_hash in self._cache:
+        key = tuple(token_ids)
+        if key in self._entries:
             return
 
-        cache_state = []
+        cache_state: list[tuple[mx.array, mx.array] | list[mx.array | None] | None] = []
         for layer_cache in cache:
             if isinstance(layer_cache, KVCache):
                 k = layer_cache.state[0]
                 v = layer_cache.state[1]
                 cache_state.append((mx.array(k), mx.array(v)))
+            elif isinstance(layer_cache, ArraysCache):
+                cache_state.append(
+                    [mx.array(s) if s is not None else None for s in layer_cache.state]
+                )
             else:
                 cache_state.append(None)
 
@@ -242,7 +290,7 @@ class PrefixCacheManager:
 
         # Skip if single entry exceeds memory limit
         if entry_bytes > self._max_bytes:
-            logger.debug(
+            logger.info(
                 "Prefix cache skip: entry %.1fMB exceeds limit %.1fGB",
                 entry_bytes / (1024 * 1024),
                 self._max_bytes / (1024 * 1024 * 1024),
@@ -251,22 +299,49 @@ class PrefixCacheManager:
 
         self._evict_until_fits(entry_bytes)
 
-        self._cache[prefix_hash] = CachedPrefix(
-            token_ids=list(token_ids),
+        entry = CachedPrefix(
+            token_ids=key,
             cache_state=cache_state,
             size_bytes=entry_bytes,
             ref_count=1,
         )
+        self._entries[key] = entry
+
+        # Insert into sorted list maintaining descending length order
+        insert_pos = 0
+        for i, existing in enumerate(self._sorted):
+            if len(key) >= len(existing.token_ids):
+                break
+            insert_pos = i + 1
+        self._sorted.insert(insert_pos, entry)
         self._current_bytes += entry_bytes
+        logger.info(
+            "Prefix cache insert: %d tokens, %.1fMB (total %d entries, %.1fMB/%.1fGB)",
+            len(key),
+            entry_bytes / (1024 * 1024),
+            len(self._entries),
+            self._current_bytes / (1024 * 1024),
+            self._max_bytes / (1024 * 1024 * 1024),
+        )
 
     def restore_cache(
-        self, cached: CachedPrefix, model: Any, is_vlm: bool
+        self,
+        cached: CachedPrefix,
+        model: Any,
+        is_vlm: bool,
+        match_len: int | None = None,
     ) -> list["AnyCache"]:
-        """Restore a cached prefix to a fresh KVCache.
+        """Restore a cached prefix to a fresh cache.
 
-        Only KVCache layers are restored. RotatingKVCache / ArraysCache layers
-        remain in their fresh state.
+        KVCache layers are restored from (k, v) tuples.
+        ArraysCache layers are restored from list[mx.array | None].
+        RotatingKVCache layers remain in their fresh state.
+
+        If match_len < len(cached.token_ids), KVCache layers are truncated
+        to match_len tokens (safe because K/V at position i depends only on
+        token i via the linear projection).
         """
+        effective_len = match_len if match_len is not None else len(cached.token_ids)
         cache_model = (
             model.language_model
             if is_vlm and hasattr(model, "language_model")
@@ -277,7 +352,15 @@ class PrefixCacheManager:
             if i < len(cached.cache_state) and cached.cache_state[i] is not None:
                 if isinstance(layer_cache, KVCache):
                     k, v = cached.cache_state[i]
-                    layer_cache.state = [mx.array(k), mx.array(v)]
+                    layer_cache.state = [
+                        mx.array(k[:, :, :effective_len, :]),
+                        mx.array(v[:, :, :effective_len, :]),
+                    ]
+                elif isinstance(layer_cache, ArraysCache):
+                    saved = cached.cache_state[i]
+                    layer_cache.state = [
+                        mx.array(s) if s is not None else None for s in saved
+                    ]
         return cache
 
     @property
@@ -292,7 +375,7 @@ class PrefixCacheManager:
             "hits": self._hits,
             "misses": self._misses,
             "hit_rate": self.hit_rate,
-            "cached_entries": len(self._cache),
+            "cached_entries": len(self._entries),
             "current_bytes": self._current_bytes,
             "max_bytes": self._max_bytes,
         }
@@ -1309,20 +1392,54 @@ class MetalModelRunner:
 
         # Create cache to check if model supports prefix caching
         cache = make_prompt_cache(cache_model)
-        # Prefix caching only safe for pure KVCache models (not Mamba/hybrid)
-        supports_prefix_cache = all(isinstance(c, KVCache) for c in cache)
+        supports_prefix_cache = all(
+            isinstance(c, (KVCache, ArraysCache)) for c in cache
+        )
 
         # Try to reuse cached prefix
         if supports_prefix_cache and self._prefix_cache is not None and len(prefix) > 0:
-            cached = self._prefix_cache.lookup(prefix)
-            if cached is not None:
-                # Cache hit: restore KV for prefix, process only last token
-                cache = self._prefix_cache.restore_cache(
-                    cached, self.model, self._is_vlm
-                )
-                cached_prefix_len = len(cached.token_ids)
+            result = self._prefix_cache.lookup(prefix)
+            stats = self._prefix_cache.get_stats()
+            hits, total = stats["hits"], stats["hits"] + stats["misses"]
+            if result is not None:
+                cached, match_len = result
+                if match_len == len(prefix):
+                    # Exact hit: restore KV for full prefix, process only last token
+                    logger.info(
+                        "Prefix cache exact HIT for %d tokens (%d/%d hits)",
+                        len(prefix),
+                        hits, total,
+                    )
+                    cache = self._prefix_cache.restore_cache(
+                        cached, self.model, self._is_vlm,
+                        match_len=match_len,
+                    )
+                    cached_prefix_len = len(prefix)
+                else:
+                    # Partial hit: restore truncated cache, process remaining
+                    # prefix, insert full prefix, then process last token
+                    logger.info(
+                        "Prefix cache partial HIT: %d of %d tokens (%d/%d hits)",
+                        match_len,
+                        len(prefix),
+                        hits, total,
+                    )
+                    cache = self._prefix_cache.restore_cache(
+                        cached, self.model, self._is_vlm,
+                        match_len=match_len,
+                    )
+                    remaining_prefix = prefix[match_len:]
+                    remaining_ids = mx.array([remaining_prefix], dtype=mx.int32)
+                    _ = self.model(remaining_ids, cache=cache)
+                    self._prefix_cache.insert(prefix, cache)
+                    cached_prefix_len = len(prefix)
             else:
                 # Cache miss: process prefix first, cache it, then last token
+                logger.info(
+                    "Prefix cache MISS for %d tokens (%d/%d hits)",
+                    len(prefix),
+                    hits, total,
+                )
                 prefix_ids = mx.array([prefix], dtype=mx.int32)
                 _ = self.model(prefix_ids, cache=cache)
                 self._prefix_cache.insert(prefix, cache)
