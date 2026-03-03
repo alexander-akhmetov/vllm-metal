@@ -488,6 +488,27 @@ class TestPrefixCacheEviction:
         mgr.insert([1, 2], [self._make_kv()])
         assert mgr._current_bytes == bytes_after_first
 
+    def test_eviction_prefers_least_recently_used(self) -> None:
+        """When ref_count is tied, evict the entry accessed least recently."""
+        kv = self._make_kv()
+        entry_bytes = kv.state[0].nbytes + kv.state[1].nbytes
+        # Room for exactly 2 entries
+        mgr = mr.PrefixCacheManager(max_bytes=entry_bytes * 2 + 1)
+
+        mgr.insert([1], [self._make_kv()])
+        mgr.insert([2], [self._make_kv()])
+
+        # Both start with ref_count=1. Lookup both to bring to ref_count=2,
+        # but [2] is looked up second so it's more recent.
+        mgr.lookup([1])
+        mgr.lookup([2])
+
+        # Insert third entry — should evict [1] (older last_used, same ref_count)
+        mgr.insert([3], [self._make_kv()])
+        assert (1,) not in mgr._entries
+        assert (2,) in mgr._entries
+        assert (3,) in mgr._entries
+
 
 class TestLongestPrefixMatch:
     """Tests for longest-prefix matching in PrefixCacheManager."""

@@ -81,7 +81,7 @@ _MIN_BATCH_SIZE_FOR_BATCHING = 2  # Minimum requests to use BatchKVCache
 _MAX_BATCH_SIZE = 64  # Maximum batch size for decode
 
 # Performance tuning
-_CACHE_CLEAR_INTERVAL = 50  # Clear cache every N finished requests
+_CACHE_CLEAR_INTERVAL = 16  # Clear cache every N finished requests
 
 # Prefix cache configuration — enabled by setting VLLM_METAL_PREFIX_CACHE
 # in the environment (any value; unset to disable).
@@ -170,6 +170,7 @@ class CachedPrefix:
     cache_state: list[tuple[mx.array, mx.array] | list[mx.array | None] | None]
     size_bytes: int = 0
     ref_count: int = 0
+    last_used: float = 0.0
 
 
 class PrefixCacheManager:
@@ -206,6 +207,7 @@ class PrefixCacheManager:
         if cached is not None:
             self._hits += 1
             cached.ref_count += 1
+            cached.last_used = time.monotonic()
             return cached, len(cached.token_ids)
 
         # Longest prefix match via LCP (linear scan, sorted longest-first)
@@ -239,6 +241,7 @@ class PrefixCacheManager:
             if not has_arrays_cache:
                 self._hits += 1
                 best_entry.ref_count += 1
+                best_entry.last_used = time.monotonic()
                 return best_entry, best_match_len
 
         self._misses += 1
@@ -246,17 +249,22 @@ class PrefixCacheManager:
 
     def _evict_until_fits(self, needed_bytes: int) -> None:
         """Evict entries until we have room for needed_bytes."""
+        evicted = False
         while self._current_bytes + needed_bytes > self._max_bytes and self._entries:
             min_key, min_entry = min(
-                self._entries.items(), key=lambda x: x[1].ref_count
+                self._entries.items(),
+                key=lambda x: (x[1].ref_count, x[1].last_used),
             )
             self._current_bytes -= min_entry.size_bytes
             del self._entries[min_key]
             self._sorted.remove(min_entry)
+            evicted = True
             logger.debug(
                 "Prefix cache eviction: freed %.1fMB",
                 min_entry.size_bytes / (1024 * 1024),
             )
+        if evicted:
+            mx.clear_cache()
 
     def insert(self, token_ids: list[int], cache: list["AnyCache"]) -> None:
         """Insert a prefix cache entry with memory-based eviction.
@@ -273,11 +281,9 @@ class PrefixCacheManager:
             if isinstance(layer_cache, KVCache):
                 k = layer_cache.state[0]
                 v = layer_cache.state[1]
-                cache_state.append((mx.array(k), mx.array(v)))
+                cache_state.append((k, v))
             elif isinstance(layer_cache, ArraysCache):
-                cache_state.append(
-                    [mx.array(s) if s is not None else None for s in layer_cache.state]
-                )
+                cache_state.append(list(layer_cache.state))
             else:
                 cache_state.append(None)
 
@@ -299,6 +305,7 @@ class PrefixCacheManager:
             cache_state=cache_state,
             size_bytes=entry_bytes,
             ref_count=1,
+            last_used=time.monotonic(),
         )
         self._entries[key] = entry
 
@@ -348,14 +355,12 @@ class PrefixCacheManager:
                 if isinstance(layer_cache, KVCache):
                     k, v = cached.cache_state[i]
                     layer_cache.state = [
-                        mx.array(k[:, :, :effective_len, :]),
-                        mx.array(v[:, :, :effective_len, :]),
+                        k[:, :, :effective_len, :],
+                        v[:, :, :effective_len, :],
                     ]
                 elif isinstance(layer_cache, ArraysCache):
                     saved = cached.cache_state[i]
-                    layer_cache.state = [
-                        mx.array(s) if s is not None else None for s in saved
-                    ]
+                    layer_cache.state = list(saved)
         return cache
 
     @property
@@ -1497,6 +1502,7 @@ class MetalModelRunner:
                     remaining_prefix = prefix[match_len:]
                     remaining_ids = mx.array([remaining_prefix], dtype=mx.int32)
                     _ = self.model(remaining_ids, cache=cache)
+                    mx.eval(*[c.state for c in cache])
                     self._prefix_cache.insert(prefix, cache)
                     cached_prefix_len = len(prefix)
             else:
@@ -1509,6 +1515,7 @@ class MetalModelRunner:
                 )
                 prefix_ids = mx.array([prefix], dtype=mx.int32)
                 _ = self.model(prefix_ids, cache=cache)
+                mx.eval(*[c.state for c in cache])
                 self._prefix_cache.insert(prefix, cache)
                 cached_prefix_len = len(prefix)
 
