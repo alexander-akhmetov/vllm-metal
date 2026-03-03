@@ -85,6 +85,21 @@ _MAX_BATCH_SIZE = 64  # Maximum batch size for decode
 # Performance tuning
 _CACHE_CLEAR_INTERVAL = 16  # Clear cache every N finished requests
 
+
+def _has_mrope(model_args: dict[str, Any]) -> bool:
+    """Check if model uses multimodal rotary position embeddings (mrope).
+
+    mrope models (e.g. Qwen3.5) store per-request offsets in
+    BatchKVCache.offset as mx.array, which is incompatible with their
+    attention code that expects cache.offset to be a Python int for mask
+    slicing.
+    """
+    rope_params = model_args.get("rope_parameters")
+    if not isinstance(rope_params, dict):
+        return False
+    return "mrope_section" in rope_params
+
+
 # Prefix cache configuration — enabled by setting VLLM_METAL_PREFIX_CACHE
 # in the environment (any value; unset to disable).
 _MIN_PREFIX_MATCH = 32  # Minimum tokens for a partial prefix match
@@ -828,6 +843,7 @@ class MetalModelRunner:
         self._is_vlm: bool = False  # Will be set during model loading
         self._is_stt: bool = False  # Will be set during model loading
         self._stt_executor: STTExecutor | None = None  # Set during STT loading
+        self._supports_batched_decode: bool = True
 
         # Request state cache for incremental decoding
         self._request_states: dict[str, RequestState] = {}
@@ -965,6 +981,7 @@ class MetalModelRunner:
                 self._extract_model_args()
                 self._resolve_model_dims()
                 self._initialize_kv_cache_dtype()
+                self._init_batched_decode_support()
                 logger.info("Model info: %s", self._get_model_info())
                 self._gen_prompt_suffix = self._detect_gen_prompt_suffix()
                 return
@@ -991,6 +1008,7 @@ class MetalModelRunner:
         self._extract_model_args()
         self._resolve_model_dims()
         self._initialize_kv_cache_dtype()
+        self._init_batched_decode_support()
         logger.info("Model info: %s", self._get_model_info())
         self._gen_prompt_suffix = self._detect_gen_prompt_suffix()
         if self._gen_prompt_suffix:
@@ -1124,6 +1142,22 @@ class MetalModelRunner:
         self.num_kv_heads: int = int(num_kv_heads)
         self.hidden_size = hidden_size
         self.head_dim: int = int(head_dim)
+
+    def _init_batched_decode_support(self) -> None:
+        """Determine whether the model supports batched decode via BatchKVCache.
+
+        mrope models (e.g. Qwen3.5) are incompatible because BatchKVCache
+        stores per-request offsets as mx.array, but their attention code uses
+        cache.offset as a Python int for mask slicing and position generation.
+        """
+        if _has_mrope(self.model_args):
+            self._supports_batched_decode = False
+            logger.info(
+                "Batched decode disabled: model uses mrope (multimodal rotary "
+                "position embeddings), incompatible with BatchKVCache"
+            )
+        else:
+            self._supports_batched_decode = True
 
     def _get_model_info(self) -> str:
         """Return a formatted string with model parameter count, quantization, and memory."""
@@ -2524,7 +2558,11 @@ class MetalModelRunner:
 
                 if valid_decode_reqs:
                     decode_t0 = time.perf_counter()
-                    if len(valid_decode_reqs) >= _MIN_BATCH_SIZE_FOR_BATCHING:
+                    use_batched = (
+                        self._supports_batched_decode
+                        and len(valid_decode_reqs) >= _MIN_BATCH_SIZE_FOR_BATCHING
+                    )
+                    if use_batched:
                         decode_tokens = self._batched_decode(valid_decode_reqs)
                     else:
                         decode_tokens = self._sequential_decode(valid_decode_reqs)
