@@ -1788,9 +1788,10 @@ class MetalModelRunner:
             state.token_ids.append(next_tokens[i])
             state.generated_tokens += 1
 
-            # Update Rust state manager if available
-            if self._rust_state_manager is not None:
-                self._rust_state_manager.append_token(req_id, next_tokens[i])
+        # Batch update Rust state manager
+        if self._rust_state_manager is not None:
+            req_ids = [req_id for req_id, _ in decode_reqs]
+            self._rust_state_manager.append_tokens_batch(req_ids, next_tokens)
 
         return next_tokens
 
@@ -2045,8 +2046,11 @@ class MetalModelRunner:
             self._paged_request_seq_lens[req_id] = (
                 self._paged_request_seq_lens.get(req_id, len(state.token_ids) - 2) + 1
             )
-            if self._rust_state_manager is not None:
-                self._rust_state_manager.append_token(req_id, next_tokens[i])
+
+        # Batch update Rust state manager
+        if self._rust_state_manager is not None:
+            req_ids = [req_id for req_id, _ in decode_reqs]
+            self._rust_state_manager.append_tokens_batch(req_ids, next_tokens)
 
         return next_tokens
 
