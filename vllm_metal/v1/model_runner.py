@@ -2032,7 +2032,7 @@ class MetalModelRunner:
                 else 0
             )
             logger.info(
-                "Decode: %.1f tok/s (%d tokens in %.2fs over %d steps, %d active reqs)",
+                "Generation: %.1f tok/s (%d tokens in %.2fs over %d steps, %d active reqs)",
                 avg_tps,
                 self._decode_step_tokens,
                 self._decode_step_time,
@@ -2104,7 +2104,7 @@ class MetalModelRunner:
                             generator=generator,
                         )
                         logger.info(
-                            "Prefill [%s]: %d/%d tokens (%.0f%%)",
+                            "Prompt [%s]: %d/%d tokens (%.0f%%)",
                             req_id[:8],
                             cur_len,
                             prompt_len,
@@ -2137,7 +2137,7 @@ class MetalModelRunner:
                     )
                     ttft = time.perf_counter() - prefill_t0
                     logger.info(
-                        "Prefill [%s] done: %d tokens in %.3fs (%.0f tok/s), TTFT=%.3fs",
+                        "Prompt [%s] done: %d tokens in %.3fs (%.0f tok/s), TTFT=%.3fs",
                         req_id[:8],
                         prompt_len,
                         ttft,
@@ -2196,7 +2196,7 @@ class MetalModelRunner:
 
                         mx.eval(*[c.state for c in kv_cache])
                         logger.info(
-                            "Prefill [%s]: %d/%d tokens (%.0f%%)",
+                            "Prompt [%s]: %d/%d tokens (%.0f%%)",
                             req_id[:8],
                             chunk_end,
                             prompt_len,
@@ -2228,7 +2228,7 @@ class MetalModelRunner:
                     )
                     ttft = time.perf_counter() - prefill_t0
                     logger.info(
-                        "Prefill [%s] done: %d tokens in %.3fs (%.0f tok/s), TTFT=%.3fs",
+                        "Prompt [%s] done: %d tokens in %.3fs (%.0f tok/s), TTFT=%.3fs",
                         req_id[:8],
                         len(token_ids),
                         ttft,
@@ -2336,7 +2336,7 @@ class MetalModelRunner:
                                 generator=state.generator,
                             )
                             logger.info(
-                                "Prefill [%s]: %d/%d tokens (%.0f%%)",
+                                "Prompt [%s]: %d/%d tokens (%.0f%%)",
                                 req_id[:8],
                                 target_len,
                                 state.prompt_len,
@@ -2364,7 +2364,7 @@ class MetalModelRunner:
                                 now - state.prefill_start if state.prefill_start else 0
                             )
                             logger.info(
-                                "Prefill [%s] done: %d tokens, TTFT=%.3fs",
+                                "Prompt [%s] done: %d tokens, TTFT=%.3fs",
                                 req_id[:8],
                                 state.prompt_len,
                                 ttft,
@@ -2437,7 +2437,7 @@ class MetalModelRunner:
                                 state.kv_len = target_len
                                 mx.eval(*[c.state for c in state.cache])
                             logger.info(
-                                "Prefill [%s]: %d/%d tokens (%.0f%%)",
+                                "Prompt [%s]: %d/%d tokens (%.0f%%)",
                                 req_id[:8],
                                 target_len,
                                 state.prompt_len,
@@ -2479,7 +2479,7 @@ class MetalModelRunner:
                                 now - state.prefill_start if state.prefill_start else 0
                             )
                             logger.info(
-                                "Prefill [%s] done: %d tokens, TTFT=%.3fs",
+                                "Prompt [%s] done: %d tokens, TTFT=%.3fs",
                                 req_id[:8],
                                 state.prompt_len,
                                 ttft,
