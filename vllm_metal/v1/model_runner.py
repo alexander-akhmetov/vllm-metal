@@ -563,6 +563,10 @@ class RequestState:
     # scheduler's ``num_computed_tokens`` when a prefix-cache hit covers tokens
     # the scheduler hasn't scheduled yet.
     kv_len: int = 0
+    # Timing for progress reporting
+    prefill_start: float = 0.0  # time.perf_counter() when prefill began
+    first_token_time: float = 0.0  # time.perf_counter() when first token was sampled
+    decode_start: float = 0.0  # time.perf_counter() when decode phase began
 
 
 def _merge_kv_caches(
@@ -875,6 +879,12 @@ class MetalModelRunner:
     def is_stt(self) -> bool:
         """Whether the loaded model is a Speech-to-Text model."""
         return self._is_stt
+
+        # Decode throughput tracking
+        self._decode_step_count: int = 0
+        self._decode_step_tokens: int = 0
+        self._decode_step_time: float = 0.0
+        self._decode_log_interval: int = 32
 
     def _is_vlm_model(self) -> bool:
         """Check if the model is a vision-language model (VLM).
@@ -1952,6 +1962,28 @@ class MetalModelRunner:
 
         return next_tokens
 
+    def _accumulate_decode_stats(self, num_tokens: int, elapsed: float) -> None:
+        """Track decode throughput and log periodically."""
+        self._decode_step_count += 1
+        self._decode_step_tokens += num_tokens
+        self._decode_step_time += elapsed
+        if self._decode_step_count >= self._decode_log_interval:
+            avg_tps = (
+                self._decode_step_tokens / self._decode_step_time
+                if self._decode_step_time > 0
+                else 0
+            )
+            logger.info(
+                "Decode: %.1f tok/s (%d tokens in %.2fs over %d steps)",
+                avg_tps,
+                self._decode_step_tokens,
+                self._decode_step_time,
+                self._decode_step_count,
+            )
+            self._decode_step_count = 0
+            self._decode_step_tokens = 0
+            self._decode_step_time = 0.0
+
     def execute_model(
         self, scheduler_output: SchedulerOutput
     ) -> ModelRunnerOutput | None:
@@ -1990,6 +2022,7 @@ class MetalModelRunner:
 
             if token_ids:
                 generator = _create_request_generator(self.device, sampling_params)
+                prefill_t0 = time.perf_counter()
 
                 if self._paged_kv_cache is not None:
                     # Paged attention path (Metal kernel)
@@ -2010,6 +2043,13 @@ class MetalModelRunner:
                             block_ids=sched_block_ids,
                             generator=generator,
                         )
+                        logger.info(
+                            "Prefill [%s]: %d/%d tokens (%.0f%%)",
+                            req_id[:8],
+                            cur_len,
+                            prompt_len,
+                            100.0 * cur_len / prompt_len,
+                        )
                         cache: list = []
                         sampled_tokens.append([])
                         self._request_states[req_id] = RequestState(
@@ -2020,6 +2060,7 @@ class MetalModelRunner:
                             generator=generator,
                             generated_tokens=0,
                             block_ids=sched_block_ids,
+                            prefill_start=prefill_t0,
                         )
                         if self._rust_state_manager is not None:
                             self._rust_state_manager.add_request(
@@ -2033,6 +2074,15 @@ class MetalModelRunner:
                         sampling_params,
                         block_ids=sched_block_ids,
                         generator=generator,
+                    )
+                    ttft = time.perf_counter() - prefill_t0
+                    logger.info(
+                        "Prefill [%s] done: %d tokens in %.3fs (%.0f tok/s), TTFT=%.3fs",
+                        req_id[:8],
+                        prompt_len,
+                        ttft,
+                        prompt_len / ttft if ttft > 0 else 0,
+                        ttft,
                     )
                     cache = []  # No per-request KV cache needed
                 else:
@@ -2085,6 +2135,13 @@ class MetalModelRunner:
                             kv_len = chunk_end
 
                         mx.eval(*[c.state for c in kv_cache])
+                        logger.info(
+                            "Prefill [%s]: %d/%d tokens (%.0f%%)",
+                            req_id[:8],
+                            chunk_end,
+                            prompt_len,
+                            100.0 * chunk_end / prompt_len,
+                        )
                         sampled_tokens.append([])
                         self._request_states[req_id] = RequestState(
                             token_ids=list(token_ids),
@@ -2094,6 +2151,7 @@ class MetalModelRunner:
                             generator=generator,
                             generated_tokens=0,
                             kv_len=kv_len,
+                            prefill_start=prefill_t0,
                         )
                         if self._rust_state_manager is not None:
                             self._rust_state_manager.add_request(
@@ -2108,9 +2166,19 @@ class MetalModelRunner:
                         sampling_params,
                         generator=generator,
                     )
+                    ttft = time.perf_counter() - prefill_t0
+                    logger.info(
+                        "Prefill [%s] done: %d tokens in %.3fs (%.0f tok/s), TTFT=%.3fs",
+                        req_id[:8],
+                        len(token_ids),
+                        ttft,
+                        len(token_ids) / ttft if ttft > 0 else 0,
+                        ttft,
+                    )
                 sampled_tokens.append([next_token])
 
                 # Store request state with cache for future decoding
+                now = time.perf_counter()
                 self._request_states[req_id] = RequestState(
                     token_ids=list(token_ids) + [next_token],
                     prompt_len=len(token_ids),
@@ -2122,6 +2190,9 @@ class MetalModelRunner:
                     if self._paged_kv_cache is not None
                     else [],
                     kv_len=len(token_ids) + 1,
+                    prefill_start=prefill_t0,
+                    first_token_time=now,
+                    decode_start=now,
                 )
 
                 # Register with Rust state manager if available
@@ -2204,6 +2275,13 @@ class MetalModelRunner:
                                 block_ids=state.block_ids,
                                 generator=state.generator,
                             )
+                            logger.info(
+                                "Prefill [%s]: %d/%d tokens (%.0f%%)",
+                                req_id[:8],
+                                target_len,
+                                state.prompt_len,
+                                100.0 * target_len / state.prompt_len,
+                            )
                             req_ids.append(req_id)
                             req_id_to_index[req_id] = len(req_ids) - 1
                             sampled_tokens.append([])
@@ -2221,6 +2299,18 @@ class MetalModelRunner:
                             state.generated_tokens = (
                                 len(state.token_ids) - state.prompt_len
                             )
+                            now = time.perf_counter()
+                            ttft = (
+                                now - state.prefill_start if state.prefill_start else 0
+                            )
+                            logger.info(
+                                "Prefill [%s] done: %d tokens, TTFT=%.3fs",
+                                req_id[:8],
+                                state.prompt_len,
+                                ttft,
+                            )
+                            state.first_token_time = now
+                            state.decode_start = now
                             if self._rust_state_manager is not None:
                                 self._rust_state_manager.append_token(
                                     req_id, next_token
@@ -2234,7 +2324,12 @@ class MetalModelRunner:
 
                 # Batch decode all generation-phase requests
                 if paged_decode_reqs:
+                    decode_t0 = time.perf_counter()
                     decode_tokens = self._batched_decode_paged(paged_decode_reqs)
+                    decode_elapsed = time.perf_counter() - decode_t0
+                    self._accumulate_decode_stats(
+                        len(paged_decode_reqs), decode_elapsed
+                    )
                     for i, (req_id, _) in enumerate(paged_decode_reqs):
                         req_ids.append(req_id)
                         req_id_to_index[req_id] = len(req_ids) - 1
@@ -2279,6 +2374,13 @@ class MetalModelRunner:
                                 _ = self.model(chunk_ids, cache=state.cache)
                                 state.kv_len = target_len
                                 mx.eval(*[c.state for c in state.cache])
+                            logger.info(
+                                "Prefill [%s]: %d/%d tokens (%.0f%%)",
+                                req_id[:8],
+                                target_len,
+                                state.prompt_len,
+                                100.0 * target_len / state.prompt_len,
+                            )
                             if self._rust_state_manager is not None:
                                 for tid in state.token_ids[computed:target_len]:
                                     self._rust_state_manager.append_token(req_id, tid)
@@ -2310,11 +2412,23 @@ class MetalModelRunner:
                                 state.token_ids[: state.prompt_len],
                                 state.generator,
                             )
+                            now = time.perf_counter()
+                            ttft = (
+                                now - state.prefill_start if state.prefill_start else 0
+                            )
+                            logger.info(
+                                "Prefill [%s] done: %d tokens, TTFT=%.3fs",
+                                req_id[:8],
+                                state.prompt_len,
+                                ttft,
+                            )
                             state.token_ids = list(
                                 state.token_ids[: state.prompt_len]
                             ) + [next_token]
                             state.generated_tokens = 1
                             state.kv_len = end + 1
+                            state.first_token_time = now
+                            state.decode_start = now
 
                             # Insert into prefix cache now that full KV is built
                             if self._prefix_cache is not None:
@@ -2347,10 +2461,15 @@ class MetalModelRunner:
                         valid_decode_reqs.append((req_id, state))
 
                 if valid_decode_reqs:
+                    decode_t0 = time.perf_counter()
                     if len(valid_decode_reqs) >= _MIN_BATCH_SIZE_FOR_BATCHING:
                         decode_tokens = self._batched_decode(valid_decode_reqs)
                     else:
                         decode_tokens = self._sequential_decode(valid_decode_reqs)
+                    decode_elapsed = time.perf_counter() - decode_t0
+                    self._accumulate_decode_stats(
+                        len(valid_decode_reqs), decode_elapsed
+                    )
 
                     for i, (req_id, _) in enumerate(valid_decode_reqs):
                         req_ids.append(req_id)
@@ -2408,9 +2527,33 @@ class MetalModelRunner:
 
         # === PHASE 3: Clean up finished requests ===
         if scheduler_output.finished_req_ids:
+            now = time.perf_counter()
             for req_id in scheduler_output.finished_req_ids:
                 state = self._request_states.pop(req_id, None)
                 if state is not None:
+                    if state.generated_tokens > 0 and state.decode_start > 0:
+                        decode_time = now - state.decode_start
+                        decode_tps = (
+                            state.generated_tokens / decode_time
+                            if decode_time > 0
+                            else 0
+                        )
+                        ttft = (
+                            state.first_token_time - state.prefill_start
+                            if state.first_token_time and state.prefill_start
+                            else 0
+                        )
+                        total = now - state.prefill_start if state.prefill_start else 0
+                        logger.info(
+                            "Done [%s]: %d prompt + %d generated tokens, "
+                            "TTFT=%.3fs, decode=%.1f tok/s, total=%.3fs",
+                            req_id[:8],
+                            state.prompt_len,
+                            state.generated_tokens,
+                            ttft,
+                            decode_tps,
+                            total,
+                        )
                     if state.cache:
                         del state.cache
                     del state
