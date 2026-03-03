@@ -426,13 +426,16 @@ def _merge_arrays_caches(caches: list[ArraysCache]) -> ArraysCache:
         if template is None:
             continue
 
-        shape = list(template.shape)
-        shape[0] = batch_size
-        merged_state = mx.zeros(tuple(shape), template.dtype)
-        for batch_idx, value in enumerate(values):
-            if value is None:
-                continue
-            merged_state[batch_idx : batch_idx + 1] = value
+        if all(v is not None for v in values):
+            merged_state = mx.concatenate(values, axis=0)
+        else:
+            shape = list(template.shape)
+            shape[0] = batch_size
+            merged_state = mx.zeros(tuple(shape), template.dtype)
+            for batch_idx, value in enumerate(values):
+                if value is None:
+                    continue
+                merged_state[batch_idx : batch_idx + 1] = value
 
         merged[entry_idx] = merged_state
 
@@ -520,6 +523,11 @@ def _merge_rotating_kv_caches(
     cache._offset = keys.shape[2]
 
     return cache
+
+
+def _to_float32(arr: mx.array) -> mx.array:
+    """Cast to float32 only if needed, avoiding a redundant copy."""
+    return arr if arr.dtype == mx.float32 else arr.astype(mx.float32)
 
 
 def _mlx_greedy_sample(logits: mx.array) -> mx.array:
@@ -1693,7 +1701,7 @@ class MetalModelRunner:
             return int(next_token_mlx.item())
 
         mx.eval(last_logits, *[c.state for c in cache])
-        logits_torch = mlx_to_torch(last_logits.astype(mx.float32), device=self.device)
+        logits_torch = mlx_to_torch(_to_float32(last_logits), device=self.device)
         generators = {} if generator is None else {0: generator}
         metadata = self._make_sampling_metadata(
             [sampling_params],
@@ -1778,7 +1786,7 @@ class MetalModelRunner:
                 if state.generator is not None
             }
             logits_torch = mlx_to_torch(
-                next_token_logits.astype(mx.float32), device=self.device
+                _to_float32(next_token_logits), device=self.device
             )
             metadata = self._make_sampling_metadata(
                 sampling_params_list,
@@ -1847,7 +1855,7 @@ class MetalModelRunner:
                 # Slow path: use vLLM sampler
                 mx.eval(last_logits)
                 logits_torch = mlx_to_torch(
-                    last_logits.astype(mx.float32), device=self.device
+                    _to_float32(last_logits), device=self.device
                 )
                 generators = {} if state.generator is None else {0: state.generator}
                 metadata = self._make_sampling_metadata(
@@ -1933,9 +1941,7 @@ class MetalModelRunner:
             next_token = int(next_token_mlx.item())
         else:
             mx.eval(last_logits)
-            logits_torch = mlx_to_torch(
-                last_logits.astype(mx.float32), device=self.device
-            )
+            logits_torch = mlx_to_torch(_to_float32(last_logits), device=self.device)
             generators = {} if generator is None else {0: generator}
             metadata = self._make_sampling_metadata(
                 [sampling_params],
@@ -2038,7 +2044,7 @@ class MetalModelRunner:
                 if state.generator is not None
             }
             logits_torch = mlx_to_torch(
-                next_token_logits.astype(mx.float32), device=self.device
+                _to_float32(next_token_logits), device=self.device
             )
             metadata = self._make_sampling_metadata(
                 sampling_params_list,
