@@ -886,7 +886,7 @@ class MetalModelRunner:
         self._decode_step_count: int = 0
         self._decode_step_tokens: int = 0
         self._decode_step_time: float = 0.0
-        self._decode_log_interval: int = 32
+        self._decode_log_interval: int = 128
         self._decode_max_active_reqs: int = 0
 
     def _is_vlm_model(self) -> bool:
