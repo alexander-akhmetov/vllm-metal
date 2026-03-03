@@ -130,15 +130,18 @@ def find_layers_and_attr(model: Any) -> tuple[list[Any], str]:
             f"Cannot find transformer layers in model of type {type(model)}"
         )
 
-    # Determine attribute name
-    if layer_list:
-        sample = layer_list[0]
-        if hasattr(sample, "self_attn"):
+    # Determine attribute name — scan all layers because hybrid models
+    # (e.g. Qwen3.5 MoE) mix standard attention and linear attention layers.
+    for layer in layer_list:
+        if hasattr(layer, "self_attn"):
             return layer_list, "self_attn"
-        elif hasattr(sample, "attention"):
+        if hasattr(layer, "attention"):
             return layer_list, "attention"
-        else:
-            raise ValueError(f"Cannot find attention module in layer {type(sample)}")
+
+    if layer_list:
+        raise ValueError(
+            f"Cannot find attention module in any layer (first: {type(layer_list[0])})"
+        )
     return layer_list, "self_attn"
 
 

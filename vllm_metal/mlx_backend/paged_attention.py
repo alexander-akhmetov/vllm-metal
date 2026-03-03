@@ -383,6 +383,8 @@ def patch_model_attention_mlx_paged(
     patched = 0
 
     for layer_idx, layer in enumerate(layer_list):
+        if not hasattr(layer, attn_attr):
+            continue  # skip non-attention layers (e.g. linear attention)
         attn = getattr(layer, attn_attr)
         if isinstance(attn, MLXPagedAttentionWrapper):
             object.__setattr__(attn, "_mlx_kv_cache", kv_cache)

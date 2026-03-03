@@ -163,6 +163,25 @@ class MetalWorker(WorkerBase):
         a configurable memory fraction, rather than blindly scaling from
         max_model_len.
         """
+        from vllm_metal.paged_attention_common import _find_layers_and_attr
+
+        # Guard: detect hybrid models (e.g. Qwen3.5 MoE) where some layers
+        # use linear attention instead of standard self_attn.  Paged attention
+        # only patches standard attention layers — linear attention layers
+        # need stateful caches that OffsetCache cannot provide.
+        layer_list, attn_attr = _find_layers_and_attr(self.model_runner.model)
+        n_attn = sum(1 for layer in layer_list if hasattr(layer, attn_attr))
+        if n_attn < len(layer_list):
+            logger.warning(
+                "Hybrid model detected: %d/%d layers have standard attention. "
+                "Paged attention is not yet supported for hybrid models "
+                "(linear attention layers need stateful caches). "
+                "Falling back to non-paged path.",
+                n_attn,
+                len(layer_list),
+            )
+            return
+
         import psutil
 
         block_size = self.metal_config.block_size
