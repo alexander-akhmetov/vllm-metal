@@ -1961,6 +1961,8 @@ class MetalModelRunner:
         """
 
         batch_size = len(decode_reqs)
+        bs = self._paged_block_size
+        cache = self._paged_kv_cache
 
         # Build request info for prepare_decode
         requests_info: list[tuple[list[int], int]] = []
