@@ -42,6 +42,9 @@ class PagedAttentionContext:
     block_tables: list[list[int]] = field(default_factory=list)
     context_lens: list[int] = field(default_factory=list)
     offsets: list[int] = field(default_factory=list)
+    # Backend-specific precomputed tensors, populated lazily by the first
+    # layer call and reused by subsequent layers within the same forward pass.
+    precomputed: Any = field(default=None, repr=False)
 
 
 def set_context(ctx: PagedAttentionContext) -> None:
