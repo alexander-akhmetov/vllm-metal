@@ -1230,12 +1230,32 @@ class MetalModelRunner:
 
         logger.info("Warming up model...")
 
-        # Run a small dummy inference (standard MLX path)
+        # Run prefill + decode warm-up to pre-compile Metal shaders at
+        # realistic sequence lengths.  Without this the first real request
+        # pays a one-time ~300 ms shader-compilation penalty.
         try:
-            dummy_tokens = mx.array([[1, 2, 3]], dtype=mx.int32)
-            output = self.model(dummy_tokens)
+            cache_model = (
+                self.model.language_model
+                if self._is_vlm and hasattr(self.model, "language_model")
+                else self.model
+            )
+            cache = make_prompt_cache(cache_model)
+
+            # Prefill: 128 tokens to compile attention/RoPE/MoE shaders
+            warm_up_len = 128
+            dummy_tokens = mx.array([list(range(1, warm_up_len + 1))], dtype=mx.int32)
+            output = self.model(dummy_tokens, cache=cache)
             logits = self._extract_logits(output)
             mx.eval(logits)
+
+            # Decode: 1 token to compile decode-path shaders
+            decode_token = mx.array([[1]], dtype=mx.int32)
+            output = self.model(decode_token, cache=cache)
+            logits = self._extract_logits(output)
+            mx.eval(logits)
+
+            del cache, output, logits
+            mx.clear_cache()
             logger.info("Model warm-up complete")
         except Exception as e:
             logger.warning(f"Model warm-up failed: {e}")
