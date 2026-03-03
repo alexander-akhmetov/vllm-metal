@@ -1792,7 +1792,7 @@ class MetalModelRunner:
             ]
 
         # Extract updated caches back to individual requests
-        for i, (req_id, state) in enumerate(decode_reqs):
+        for i, (_req_id, state) in enumerate(decode_reqs):
             state.cache = _extract_kv_cache(batch_cache, i)
             state.token_ids.append(next_tokens[i])
             state.generated_tokens += 1

@@ -44,10 +44,10 @@ class TestWarmUp:
         assert len(forward_calls) == 2, (
             f"Expected 2 forward calls, got {len(forward_calls)}"
         )
-        # First call: prefill with ~128 tokens and cache
+        # First call: prefill with 2 tokens and cache
         prefill_shape, prefill_has_cache = forward_calls[0]
-        assert prefill_shape[1] == 128, (
-            f"Prefill should use 128 tokens, got {prefill_shape[1]}"
+        assert prefill_shape[1] == 2, (
+            f"Prefill should use 2 tokens, got {prefill_shape[1]}"
         )
         assert prefill_has_cache, "Prefill should use a cache"
         # Second call: decode with 1 token and same cache
@@ -140,8 +140,8 @@ class TestWarmUp:
         # Should not raise
         runner.warm_up()
 
-    def test_warm_up_preserves_paged_attention_kernel_warmup(self, monkeypatch) -> None:
-        """warm_up() should still call _warm_up_paged_attention_kernel when paged cache exists."""
+    def test_warm_up_preserves_paged_attention_warmup(self, monkeypatch) -> None:
+        """warm_up() should still call _warm_up_paged_attention when paged cache exists."""
         monkeypatch.setattr(mr, "make_prompt_cache", lambda model: [MagicMock()])
 
         runner = self._make_runner()
@@ -154,12 +154,12 @@ class TestWarmUp:
         runner._paged_kv_cache = MagicMock()
         monkeypatch.setattr(
             runner,
-            "_warm_up_paged_attention_kernel",
+            "_warm_up_paged_attention",
             lambda: paged_warmup_called.append(True),
         )
 
         runner.warm_up()
 
         assert len(paged_warmup_called) == 1, (
-            "Paged attention kernel warm-up should still be called"
+            "Paged attention warm-up should still be called"
         )
