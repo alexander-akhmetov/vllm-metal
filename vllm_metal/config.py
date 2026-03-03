@@ -30,6 +30,7 @@ class MetalConfig:
     block_size: int
     debug: bool
     use_paged_attention: bool = False
+    paged_backend: Literal["mlx", "metal_kernel"] = "mlx"
 
     def __post_init__(self) -> None:
         if self.block_size <= 0:
@@ -69,6 +70,7 @@ class MetalConfig:
             debug=os.environ.get("VLLM_METAL_DEBUG", "0") == "1",
             use_paged_attention=os.environ.get("VLLM_METAL_USE_PAGED_ATTENTION", "0")
             == "1",
+            paged_backend=os.environ.get("VLLM_METAL_PAGED_BACKEND", "mlx"),  # type: ignore[arg-type]
         )
 
 

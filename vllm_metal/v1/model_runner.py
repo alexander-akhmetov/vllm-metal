@@ -1360,21 +1360,31 @@ class MetalModelRunner:
 
         # Paged attention kernel warm-up: load kernel + smoke-test Metal ops
         if hasattr(self, "_paged_kv_cache") and self._paged_kv_cache is not None:
-            self._warm_up_paged_attention_kernel()
+            self._warm_up_paged_attention()
 
-    def _warm_up_paged_attention_kernel(self) -> None:
-        """JIT-compile vendored Metal shaders and verify ops work.
+    def _warm_up_paged_attention(self) -> None:
+        """Warm up the paged attention backend.
 
-        Calls ``get_ops()`` which triggers JIT build of the C++ nanobind
-        extension + Metal shader compilation via MLX's device.get_library().
-        Then runs a single-token ``reshape_and_cache`` smoke test against
-        layer 0 of the already-allocated cache.
+        For the Metal kernel backend: JIT-compiles vendored Metal shaders
+        via ``get_ops()`` and smoke-tests reshape_and_cache against layer 0.
+
+        For the MLX backend: runs a simple mx.eval to ensure cache arrays
+        are materialized.
         """
+        from vllm_metal.mlx_backend.paged_cache import MLXPagedKVCache
+
+        cache = self._paged_kv_cache
+
+        if isinstance(cache, MLXPagedKVCache):
+            logger.info("Warming up MLX paged attention cache...")
+            mx.eval(cache.key_caches[0], cache.value_caches[0])
+            logger.info("MLX paged attention warm-up complete")
+            return
+
+        # Metal kernel backend: load kernel + smoke-test
         import platform
 
         from vllm_metal.metal import get_ops
-
-        cache = self._paged_kv_cache
 
         logger.info("Warming up paged attention Metal kernel...")
 
@@ -1386,7 +1396,6 @@ class MetalModelRunner:
                 f"macOS version: {platform.mac_ver()[0]}"
             ) from e
 
-        # Smoke-test: single-token reshape_and_cache on layer 0
         try:
             dummy_k = mx.zeros(
                 (1, cache.num_kv_heads, cache.head_dim), dtype=cache.dtype
@@ -1877,8 +1886,9 @@ class MetalModelRunner:
     ) -> int:
         """Paged-attention prefill for a single request.
 
-        Uses MLX for inline SDPA, then writes K/V to MPS paged cache via
-        the HF reshape_and_cache kernel. Returns the next token.
+        Uses the patched attention wrappers (MLX-native or Metal kernel)
+        to compute SDPA and write K/V into the paged cache.
+        Returns the next token.
         """
         num_tokens = len(token_ids)
         if prompt_len is None:
@@ -1946,8 +1956,8 @@ class MetalModelRunner:
     ) -> list[int]:
         """Paged-attention batched decode.
 
-        Uses MLX for projections + per-request RoPE, then the HF kernel for
-        reshape_and_cache + paged_attention_v1 (zero-copy from block tables).
+        Uses the patched attention wrappers (MLX-native or Metal kernel)
+        to write new tokens and compute attention against cached KV.
         """
 
         batch_size = len(decode_reqs)

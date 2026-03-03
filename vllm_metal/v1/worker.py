@@ -154,7 +154,10 @@ class MetalWorker(WorkerBase):
             self._setup_paged_attention()
 
     def _setup_paged_attention(self) -> None:
-        """Create MetalPagedKVCache and patch model attention for native Metal kernel.
+        """Create paged KV cache and patch model attention.
+
+        Dispatches to the MLX-native backend (default) or the Metal kernel
+        backend based on ``metal_config.paged_backend``.
 
         Computes num_blocks from available system RAM, model weight size, and
         a configurable memory fraction, rather than blindly scaling from
@@ -162,12 +165,6 @@ class MetalWorker(WorkerBase):
         """
         import psutil
 
-        from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
-        from vllm_metal.metal_kernel_backend.paged_attention import (
-            patch_model_attention_metal_kernel,
-        )
-
-        runner = self.model_runner
         block_size = self.metal_config.block_size
 
         # --- Determine memory fraction ---
@@ -255,7 +252,61 @@ class MetalWorker(WorkerBase):
             max_tokens_cached,
         )
 
-        # --- Create cache and patch model ---
+        backend = self.metal_config.paged_backend
+        if backend == "mlx":
+            self._setup_paged_attention_mlx(num_blocks, block_size)
+        elif backend == "metal_kernel":
+            self._setup_paged_attention_metal_kernel(num_blocks, block_size)
+        else:
+            raise ValueError(
+                f"Unknown VLLM_METAL_PAGED_BACKEND={backend!r}. "
+                "Valid options: 'mlx', 'metal_kernel'."
+            )
+
+    def _setup_paged_attention_mlx(self, num_blocks: int, block_size: int) -> None:
+        """Create MLXPagedKVCache and patch model with MLX-native attention."""
+        from vllm_metal.mlx_backend.paged_attention import (
+            patch_model_attention_mlx_paged,
+        )
+        from vllm_metal.mlx_backend.paged_cache import MLXPagedKVCache
+
+        runner = self.model_runner
+
+        mlx_kv_cache = MLXPagedKVCache(
+            num_layers=runner.num_layers,
+            num_kv_heads=runner.num_kv_heads,
+            head_dim=runner.head_dim,
+            num_blocks=num_blocks,
+            block_size=block_size,
+        )
+
+        n_patched = patch_model_attention_mlx_paged(
+            runner.model, mlx_kv_cache, block_size
+        )
+        logger.info(
+            "MLX paged attention enabled: %d layers patched, "
+            "%d blocks allocated (block_size=%d, kv_heads=%d, head_dim=%d)",
+            n_patched,
+            num_blocks,
+            block_size,
+            runner.num_kv_heads,
+            runner.head_dim,
+        )
+
+        runner._paged_kv_cache = mlx_kv_cache
+        runner._paged_block_size = block_size
+
+    def _setup_paged_attention_metal_kernel(
+        self, num_blocks: int, block_size: int
+    ) -> None:
+        """Create MetalPagedKVCache and patch model for Metal kernel backend."""
+        from vllm_metal.metal_kernel_backend.cache import MetalPagedKVCache
+        from vllm_metal.metal_kernel_backend.paged_attention import (
+            patch_model_attention_metal_kernel,
+        )
+
+        runner = self.model_runner
+
         if runner.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; runner.load_model()")
 
@@ -281,7 +332,6 @@ class MetalWorker(WorkerBase):
             runner.head_dim,
         )
 
-        # Store on model runner for use by paged prefill/decode
         runner._paged_kv_cache = metal_kv_cache
         runner._paged_block_size = block_size
 
