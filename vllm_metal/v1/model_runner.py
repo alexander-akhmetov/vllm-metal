@@ -18,6 +18,7 @@ from threading import Lock
 from typing import Any, TypeAlias
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 import torch
 from mlx_lm import load as mlx_lm_load
@@ -885,6 +886,7 @@ class MetalModelRunner:
         self._decode_step_tokens: int = 0
         self._decode_step_time: float = 0.0
         self._decode_log_interval: int = 32
+        self._decode_max_active_reqs: int = 0
 
     def _is_vlm_model(self) -> bool:
         """Check if the model is a vision-language model (VLM).
@@ -962,6 +964,7 @@ class MetalModelRunner:
                 self._extract_model_args()
                 self._resolve_model_dims()
                 self._initialize_kv_cache_dtype()
+                logger.info("Model info: %s", self._get_model_info())
                 self._gen_prompt_suffix = self._detect_gen_prompt_suffix()
                 return
 
@@ -987,6 +990,7 @@ class MetalModelRunner:
         self._extract_model_args()
         self._resolve_model_dims()
         self._initialize_kv_cache_dtype()
+        logger.info("Model info: %s", self._get_model_info())
         self._gen_prompt_suffix = self._detect_gen_prompt_suffix()
         if self._gen_prompt_suffix:
             logger.info(
@@ -1120,6 +1124,38 @@ class MetalModelRunner:
         self.hidden_size = hidden_size
         self.head_dim: int = int(head_dim)
 
+    def _get_model_info(self) -> str:
+        """Return a formatted string with model parameter count, quantization, and memory."""
+        num_params = sum(
+            p.size for _, p in mx.utils.tree_flatten(self.model.parameters())
+        )
+        if num_params >= 1e9:
+            params_str = f"{num_params / 1e9:.1f}B params"
+        else:
+            params_str = f"{num_params / 1e6:.0f}M params"
+
+        # Detect quantization by walking the model tree
+        quant_str = "fp16"
+        for _, module in self.model.named_modules():
+            if isinstance(module, nn.QuantizedLinear):
+                bits = getattr(module, "bits", None)
+                group_size = getattr(module, "group_size", None)
+                if bits and group_size:
+                    quant_str = f"{bits}-bit (group_size={group_size})"
+                elif bits:
+                    quant_str = f"{bits}-bit"
+                break
+
+        mem_str = ""
+        if hasattr(mx, "metal") and hasattr(mx.metal, "get_active_memory"):
+            active_bytes = mx.metal.get_active_memory()
+            mem_str = f", {active_bytes / 1e9:.1f} GB active memory"
+        elif hasattr(mx, "get_active_memory"):
+            active_bytes = mx.get_active_memory()
+            mem_str = f", {active_bytes / 1e9:.1f} GB active memory"
+
+        return f"{params_str}, {quant_str}{mem_str}"
+
     def _extract_logits(self, model_output: Any) -> mx.array:
         """Extract logits from model output.
 
@@ -1244,6 +1280,7 @@ class MetalModelRunner:
         # Even 2 tokens is enough to compile all shader variants (attention,
         # RoPE, MoE routing, expert kernels).  We keep it minimal because
         # first-time compilation on large MoE models can take tens of seconds.
+        warmup_t0 = time.perf_counter()
         try:
             cache_model = (
                 self.model.language_model
@@ -1268,9 +1305,23 @@ class MetalModelRunner:
 
             del cache, output, logits
             mx.clear_cache()
-            logger.info("Model warm-up complete")
-        except Exception as e:
-            logger.warning(f"Model warm-up failed: {e}")
+
+            warmup_elapsed = time.perf_counter() - warmup_t0
+            active_gb = 0.0
+            peak_gb = 0.0
+            if hasattr(mx, "metal"):
+                if hasattr(mx.metal, "get_active_memory"):
+                    active_gb = mx.metal.get_active_memory() / 1e9
+                if hasattr(mx.metal, "get_peak_memory"):
+                    peak_gb = mx.metal.get_peak_memory() / 1e9
+            logger.info(
+                "Model warm-up complete in %.2fs (active=%.1f GB, peak=%.1f GB)",
+                warmup_elapsed,
+                active_gb,
+                peak_gb,
+            )
+        except Exception:
+            logger.warning("Model warm-up failed", exc_info=True)
 
         # Paged attention kernel warm-up: load kernel + smoke-test Metal ops
         if hasattr(self, "_paged_kv_cache") and self._paged_kv_cache is not None:
@@ -1964,11 +2015,15 @@ class MetalModelRunner:
 
         return next_tokens
 
-    def _accumulate_decode_stats(self, num_tokens: int, elapsed: float) -> None:
+    def _accumulate_decode_stats(
+        self, num_tokens: int, elapsed: float, active_reqs: int
+    ) -> None:
         """Track decode throughput and log periodically."""
         self._decode_step_count += 1
         self._decode_step_tokens += num_tokens
         self._decode_step_time += elapsed
+        if active_reqs > self._decode_max_active_reqs:
+            self._decode_max_active_reqs = active_reqs
         if self._decode_step_count >= self._decode_log_interval:
             avg_tps = (
                 self._decode_step_tokens / self._decode_step_time
@@ -1976,15 +2031,17 @@ class MetalModelRunner:
                 else 0
             )
             logger.info(
-                "Decode: %.1f tok/s (%d tokens in %.2fs over %d steps)",
+                "Decode: %.1f tok/s (%d tokens in %.2fs over %d steps, %d active reqs)",
                 avg_tps,
                 self._decode_step_tokens,
                 self._decode_step_time,
                 self._decode_step_count,
+                self._decode_max_active_reqs,
             )
             self._decode_step_count = 0
             self._decode_step_tokens = 0
             self._decode_step_time = 0.0
+            self._decode_max_active_reqs = 0
 
     def execute_model(
         self, scheduler_output: SchedulerOutput
@@ -2330,7 +2387,9 @@ class MetalModelRunner:
                     decode_tokens = self._batched_decode_paged(paged_decode_reqs)
                     decode_elapsed = time.perf_counter() - decode_t0
                     self._accumulate_decode_stats(
-                        len(paged_decode_reqs), decode_elapsed
+                        len(paged_decode_reqs),
+                        decode_elapsed,
+                        len(self._request_states),
                     )
                     for i, (req_id, _) in enumerate(paged_decode_reqs):
                         req_ids.append(req_id)
@@ -2470,7 +2529,9 @@ class MetalModelRunner:
                         decode_tokens = self._sequential_decode(valid_decode_reqs)
                     decode_elapsed = time.perf_counter() - decode_t0
                     self._accumulate_decode_stats(
-                        len(valid_decode_reqs), decode_elapsed
+                        len(valid_decode_reqs),
+                        decode_elapsed,
+                        len(self._request_states),
                     )
 
                     for i, (req_id, _) in enumerate(valid_decode_reqs):

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import gc
+import os
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
@@ -110,6 +111,19 @@ class MetalWorker(WorkerBase):
         # while falling back to CPU if MPS is not available.
         self.device = MetalPlatform.get_torch_device(0)
         logger.info(f"PyTorch device set to: {self.device}")
+
+        logger.info(
+            "Metal config: memory=%s, paged_attention=%s, block_size=%d, "
+            "prefix_cache=%s, mlx_device=%s, debug=%s",
+            "auto"
+            if self.metal_config.is_auto_memory
+            else f"{self.metal_config.memory_fraction:.0%}",
+            self.metal_config.use_paged_attention,
+            self.metal_config.block_size,
+            "VLLM_METAL_PREFIX_CACHE" in os.environ,
+            self.metal_config.mlx_device,
+            self.metal_config.debug,
+        )
 
         # Initialize distributed environment
         init_worker_distributed_environment(
