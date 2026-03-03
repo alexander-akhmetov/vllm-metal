@@ -1240,9 +1240,10 @@ class MetalModelRunner:
 
         logger.info("Warming up model...")
 
-        # Run prefill + decode warm-up to pre-compile Metal shaders at
-        # realistic sequence lengths.  Without this the first real request
-        # pays a one-time ~300 ms shader-compilation penalty.
+        # Run prefill + decode warm-up to pre-compile Metal shaders.
+        # Even 2 tokens is enough to compile all shader variants (attention,
+        # RoPE, MoE routing, expert kernels).  We keep it minimal because
+        # first-time compilation on large MoE models can take tens of seconds.
         try:
             cache_model = (
                 self.model.language_model
@@ -1251,15 +1252,16 @@ class MetalModelRunner:
             )
             cache = make_prompt_cache(cache_model)
 
-            # Prefill: 128 tokens to compile attention/RoPE/MoE shaders
-            warm_up_len = 128
-            dummy_tokens = mx.array([list(range(1, warm_up_len + 1))], dtype=mx.int32)
+            # Prefill: 2 tokens to compile shaders
+            dummy_tokens = mx.array([[1, 2]], dtype=mx.int32)
+            logger.info("Warm-up: compiling prefill shaders...")
             output = self.model(dummy_tokens, cache=cache)
             logits = self._extract_logits(output)
             mx.eval(logits)
 
             # Decode: 1 token to compile decode-path shaders
             decode_token = mx.array([[1]], dtype=mx.int32)
+            logger.info("Warm-up: compiling decode shaders...")
             output = self.model(decode_token, cache=cache)
             logits = self._extract_logits(output)
             mx.eval(logits)
