@@ -19,6 +19,7 @@ from typing import Any, TypeAlias
 
 import mlx.core as mx
 import mlx.nn as nn
+import mlx.utils
 import numpy as np
 import torch
 from mlx_lm import load as mlx_lm_load
@@ -1127,7 +1128,7 @@ class MetalModelRunner:
     def _get_model_info(self) -> str:
         """Return a formatted string with model parameter count, quantization, and memory."""
         num_params = sum(
-            p.size for _, p in mx.utils.tree_flatten(self.model.parameters())
+            p.size for _, p in mlx.utils.tree_flatten(self.model.parameters())
         )
         if num_params >= 1e9:
             params_str = f"{num_params / 1e9:.1f}B params"
