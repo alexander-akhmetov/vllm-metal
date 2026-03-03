@@ -554,6 +554,10 @@ class RequestState:
     block_ids: list[int] = field(
         default_factory=list
     )  # Scheduler-assigned paged KV blocks
+    # Tokens whose KV values are materialised in ``cache``.  May exceed the
+    # scheduler's ``num_computed_tokens`` when a prefix-cache hit covers tokens
+    # the scheduler hasn't scheduled yet.
+    kv_len: int = 0
 
 
 def _merge_kv_caches(
@@ -1518,7 +1522,28 @@ class MetalModelRunner:
         # Extract last token logits
         last_logits = logits[:, -1, :]
 
-        # Use native MLX greedy sampling when possible (avoids PyTorch round-trip)
+        next_token = self._sample_next_token(
+            last_logits, cache, sampling_params, token_ids, generator
+        )
+        return next_token, cache
+
+    def _sample_next_token(
+        self,
+        last_logits: mx.array,
+        cache: list[AnyCache],
+        sampling_params: SamplingParams,
+        token_ids: list[int],
+        generator: torch.Generator | None = None,
+    ) -> int:
+        """Sample a single next token from logits.
+
+        Uses native MLX greedy sampling when possible (avoids PyTorch
+        round-trip); falls back to vLLM's sampler for advanced strategies
+        (top-k/p, penalties, temperature).
+
+        Evaluates both the logits and all cache layer states in a single
+        ``mx.eval`` call so the computation graph is flushed.
+        """
         is_greedy = sampling_params.temperature < 1e-5
         needs_advanced_sampling = (
             sampling_params.top_k > 0
@@ -1529,30 +1554,21 @@ class MetalModelRunner:
         )
 
         if is_greedy and not needs_advanced_sampling:
-            # Fast path: native MLX greedy sampling
             next_token_mlx = _mlx_greedy_sample(last_logits)
-            # Single eval for logits, token, and cache state together
             mx.eval(next_token_mlx, *[c.state for c in cache])
-            next_token = int(next_token_mlx.item())
-        else:
-            # Slow path: use vLLM sampler for advanced sampling
-            # Single eval for logits and cache state together
-            mx.eval(last_logits, *[c.state for c in cache])
-            # Convert to torch for sampling
-            logits_torch = mlx_to_torch(
-                last_logits.astype(mx.float32), device=self.device
-            )
-            generators = {} if generator is None else {0: generator}
-            metadata = self._make_sampling_metadata(
-                [sampling_params],
-                [token_ids],
-                [[]],
-                generators=generators,
-            )
-            output = self._sampler.forward(logits_torch, metadata)
-            next_token = int(output.sampled_token_ids[0, 0].item())
+            return int(next_token_mlx.item())
 
-        return next_token, cache
+        mx.eval(last_logits, *[c.state for c in cache])
+        logits_torch = mlx_to_torch(last_logits.astype(mx.float32), device=self.device)
+        generators = {} if generator is None else {0: generator}
+        metadata = self._make_sampling_metadata(
+            [sampling_params],
+            [token_ids],
+            [[]],
+            generators=generators,
+        )
+        output = self._sampler.forward(logits_torch, metadata)
+        return int(output.sampled_token_ids[0, 0].item())
 
     def _batched_decode(self, decode_reqs: list[tuple[str, RequestState]]) -> list[int]:
         """Process multiple decode requests in a single batched forward pass.
@@ -1993,6 +2009,72 @@ class MetalModelRunner:
                     )
                     cache = []  # No per-request KV cache needed
                 else:
+                    # Non-paged SDPA path — check for chunked prefill
+                    scheduled_tokens = scheduler_output.num_scheduled_tokens.get(
+                        req_id, 0
+                    )
+                    computed_tokens = new_req.num_computed_tokens
+                    prompt_len = len(token_ids)
+
+                    if computed_tokens + scheduled_tokens < prompt_len:
+                        # Intermediate chunk: build KV cache, no sampling.
+                        chunk_end = computed_tokens + scheduled_tokens
+                        cache_model = (
+                            self.model.language_model
+                            if self._is_vlm and hasattr(self.model, "language_model")
+                            else self.model
+                        )
+                        kv_cache: list[AnyCache] = make_prompt_cache(cache_model)
+                        kv_len = 0
+
+                        # Prefix cache: query the full prompt prefix to
+                        # maximise reuse (may cover well beyond this chunk).
+                        if self._prefix_cache is not None:
+                            gen_suffix = self._gen_prompt_suffix
+                            if (
+                                gen_suffix
+                                and prompt_len > len(gen_suffix) + 1
+                                and tuple(token_ids[-len(gen_suffix) :]) == gen_suffix
+                            ):
+                                cb = prompt_len - len(gen_suffix)
+                            else:
+                                cb = prompt_len - 1 if prompt_len > 1 else 0
+                            result = self._prefix_cache.lookup(token_ids[:cb])
+                            if result is not None:
+                                cached, match_len = result
+                                kv_cache = self._prefix_cache.restore_cache(
+                                    cached,
+                                    self.model,
+                                    self._is_vlm,
+                                    match_len=match_len,
+                                )
+                                kv_len = match_len
+
+                        if kv_len < chunk_end:
+                            chunk_ids = mx.array(
+                                [token_ids[kv_len:chunk_end]], dtype=mx.int32
+                            )
+                            _ = self.model(chunk_ids, cache=kv_cache)
+                            kv_len = chunk_end
+
+                        mx.eval(*[c.state for c in kv_cache])
+                        sampled_tokens.append([])
+                        self._request_states[req_id] = RequestState(
+                            token_ids=list(token_ids),
+                            prompt_len=prompt_len,
+                            cache=kv_cache,
+                            sampling_params=sampling_params,
+                            generator=generator,
+                            generated_tokens=0,
+                            kv_len=kv_len,
+                        )
+                        if self._rust_state_manager is not None:
+                            self._rust_state_manager.add_request(
+                                req_id, list(token_ids[:chunk_end])
+                            )
+                        continue
+
+                    # Full prompt fits in this step
                     next_token, cache = self._prefill_single(
                         req_id,
                         token_ids,
@@ -2012,6 +2094,7 @@ class MetalModelRunner:
                     block_ids=sched_block_ids
                     if self._paged_kv_cache is not None
                     else [],
+                    kv_len=len(token_ids) + 1,
                 )
 
                 # Register with Rust state manager if available
@@ -2130,11 +2213,110 @@ class MetalModelRunner:
                         req_id_to_index[req_id] = len(req_ids) - 1
                         sampled_tokens.append([decode_tokens[i]])
             else:
-                # Collect all valid decode requests
-                valid_decode_reqs = []
+                # Non-paged SDPA path: handle both prefill continuation
+                # (chunked prefill) and decode.
+                req_id_to_cached_idx = {
+                    rid: i for i, rid in enumerate(cached_reqs.req_ids)
+                }
+                valid_decode_reqs: list[tuple[str, RequestState]] = []
+
                 for req_id in decode_req_ids:
                     state = self._request_states.get(req_id)
-                    if state is not None:
+                    if state is None:
+                        req_ids.append(req_id)
+                        req_id_to_index[req_id] = len(req_ids) - 1
+                        sampled_tokens.append([0])
+                        continue
+
+                    if state.generated_tokens == 0:
+                        # Still prefilling (chunked prefill continuation)
+                        idx = req_id_to_cached_idx.get(req_id)
+                        if idx is not None and idx < len(
+                            cached_reqs.num_computed_tokens
+                        ):
+                            computed = cached_reqs.num_computed_tokens[idx]
+                        else:
+                            computed = 0
+                        scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+                        target_len = computed + scheduled
+
+                        # Compute only tokens not yet in the KV cache
+                        kv_start = state.kv_len
+                        if target_len < state.prompt_len:
+                            # Intermediate chunk
+                            if kv_start < target_len:
+                                chunk_ids = mx.array(
+                                    [state.token_ids[kv_start:target_len]],
+                                    dtype=mx.int32,
+                                )
+                                _ = self.model(chunk_ids, cache=state.cache)
+                                state.kv_len = target_len
+                                mx.eval(*[c.state for c in state.cache])
+                            if self._rust_state_manager is not None:
+                                for tid in state.token_ids[computed:target_len]:
+                                    self._rust_state_manager.append_token(req_id, tid)
+                            req_ids.append(req_id)
+                            req_id_to_index[req_id] = len(req_ids) - 1
+                            sampled_tokens.append([])
+                        else:
+                            # Final chunk: complete prefill and sample.
+                            # kv_start < end is guaranteed because the prefix
+                            # cache stores at most prompt_len-1 tokens and
+                            # intermediate chunks cap at prompt_len-1.
+                            end = state.prompt_len
+                            assert kv_start < end, (
+                                f"chunked prefill: kv_len={kv_start} >= "
+                                f"prompt_len={end} for {req_id}"
+                            )
+                            remaining_ids = mx.array(
+                                [state.token_ids[kv_start:end]],
+                                dtype=mx.int32,
+                            )
+                            model_output = self.model(remaining_ids, cache=state.cache)
+                            logits = self._extract_logits(model_output)
+                            last_logits = logits[:, -1, :]
+
+                            next_token = self._sample_next_token(
+                                last_logits,
+                                state.cache,
+                                state.sampling_params,
+                                state.token_ids[: state.prompt_len],
+                                state.generator,
+                            )
+                            state.token_ids = list(
+                                state.token_ids[: state.prompt_len]
+                            ) + [next_token]
+                            state.generated_tokens = 1
+                            state.kv_len = end + 1
+
+                            # Insert into prefix cache now that full KV is built
+                            if self._prefix_cache is not None:
+                                gen_suffix = self._gen_prompt_suffix
+                                tids = state.token_ids[: state.prompt_len]
+                                if (
+                                    gen_suffix
+                                    and len(tids) > len(gen_suffix) + 1
+                                    and tuple(tids[-len(gen_suffix) :]) == gen_suffix
+                                ):
+                                    boundary = len(tids) - len(gen_suffix)
+                                else:
+                                    boundary = len(tids) - 1 if len(tids) > 1 else 0
+                                if boundary > 0:
+                                    self._prefix_cache.insert(
+                                        tids[:boundary], state.cache
+                                    )
+
+                            if self._rust_state_manager is not None:
+                                for tid in state.token_ids[computed : state.prompt_len]:
+                                    self._rust_state_manager.append_token(req_id, tid)
+                                self._rust_state_manager.append_token(
+                                    req_id, next_token
+                                )
+                            req_ids.append(req_id)
+                            req_id_to_index[req_id] = len(req_ids) - 1
+                            sampled_tokens.append([next_token])
+                    else:
+                        # Decode phase
                         valid_decode_reqs.append((req_id, state))
 
                 if valid_decode_reqs:
@@ -2143,18 +2325,10 @@ class MetalModelRunner:
                     else:
                         decode_tokens = self._sequential_decode(valid_decode_reqs)
 
-                    # Add decode results to output
                     for i, (req_id, _) in enumerate(valid_decode_reqs):
                         req_ids.append(req_id)
                         req_id_to_index[req_id] = len(req_ids) - 1
                         sampled_tokens.append([decode_tokens[i]])
-
-                # Handle requests with no cached state (edge case)
-                for req_id in decode_req_ids:
-                    if req_id not in req_id_to_index:
-                        req_ids.append(req_id)
-                        req_id_to_index[req_id] = len(req_ids) - 1
-                        sampled_tokens.append([0])
 
         # Consistency check: every scheduled request must be represented in
         # req_ids, and decode-phase scheduled requests should not emit empty
